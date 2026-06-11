@@ -248,10 +248,7 @@ fn get_cache_file_path(connection_uuid: &str) -> PathBuf {
 }
 
 /// Store credentials in a file (fallback when keyring unavailable)
-async fn store_file_cached_credentials(
-    connection_uuid: &str,
-    tokens: &StoredTokens,
-) -> Result<()> {
+async fn store_file_cached_credentials(connection_uuid: &str, tokens: &StoredTokens) -> Result<()> {
     let cache_dir = PathBuf::from(CACHE_DIR);
 
     // Create cache directory if it doesn't exist
@@ -283,10 +280,7 @@ async fn store_file_cached_credentials(
         std::fs::set_permissions(&cache_file, perms)?;
     }
 
-    info!(
-        "Stored credentials in file cache: {}",
-        cache_file.display()
-    );
+    info!("Stored credentials in file cache: {}", cache_file.display());
     Ok(())
 }
 

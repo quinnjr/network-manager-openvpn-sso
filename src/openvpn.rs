@@ -206,7 +206,10 @@ impl OpenVpnManager {
         // Check for cached credentials before starting
         let cached_token = secrets::get_cached_credentials(&self.config.uuid).await;
         if cached_token.is_some() {
-            info!("Found cached credentials for connection {}", self.config.uuid);
+            info!(
+                "Found cached credentials for connection {}",
+                self.config.uuid
+            );
         }
 
         // Send initial commands
@@ -239,10 +242,7 @@ impl OpenVpnManager {
                 // Format: >PASSWORD:Auth-Token:SESS_ID_AT_...
                 if auth_type.starts_with("Auth-Token:") {
                     let token = auth_type.strip_prefix("Auth-Token:").unwrap().trim();
-                    info!(
-                        "Received Auth-Token from server (length: {})",
-                        token.len()
-                    );
+                    info!("Received Auth-Token from server (length: {})", token.len());
                     if !token.is_empty() {
                         self.auth_token = Some(token.to_string());
                     }
@@ -508,13 +508,16 @@ impl OpenVpnManager {
 
                                     // Extract server base URL from auth URL for POSTing back
                                     let server_base = match url::Url::parse(&url) {
-                                        Ok(u) => format!("{}://{}:{}", u.scheme(),
+                                        Ok(u) => format!(
+                                            "{}://{}:{}",
+                                            u.scheme(),
                                             u.host_str().unwrap_or(""),
-                                            u.port().unwrap_or(9000)),
+                                            u.port().unwrap_or(9000)
+                                        ),
                                         Err(e) => {
                                             error!("Failed to parse auth URL: {}", e);
                                             url.clone()
-                                        },
+                                        }
                                     };
 
                                     // Spawn the SSO flow (localhost server + browser + POST)
@@ -522,9 +525,14 @@ impl OpenVpnManager {
                                     let url_clone = url.clone();
                                     tokio::spawn(async move {
                                         match crate::oauth::authenticate_sso(
-                                            &url_clone, &server_base
-                                        ).await {
-                                            Ok(()) => info!("SSO authentication completed successfully"),
+                                            &url_clone,
+                                            &server_base,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => {
+                                                info!("SSO authentication completed successfully")
+                                            }
                                             Err(e) => error!("SSO authentication failed: {}", e),
                                         }
                                     });
@@ -532,7 +540,10 @@ impl OpenVpnManager {
                                     info!("SSO auth already initiated, skipping duplicate");
                                 }
                             } else {
-                                warn!("AUTH_PENDING state but no OPEN_URL found in: {}", full_state);
+                                warn!(
+                                    "AUTH_PENDING state but no OPEN_URL found in: {}",
+                                    full_state
+                                );
                             }
 
                             self.event_tx
@@ -702,7 +713,12 @@ impl OpenVpnManager {
         // Extract the VPN server host from the auth URL for later POSTing
         // auth_url looks like: http://34.214.23.25:9000/auth/start?state=...
         let server_base_url = match url::Url::parse(auth_url) {
-            Ok(u) => format!("{}://{}:{}", u.scheme(), u.host_str().unwrap_or(""), u.port().unwrap_or(9000)),
+            Ok(u) => format!(
+                "{}://{}:{}",
+                u.scheme(),
+                u.host_str().unwrap_or(""),
+                u.port().unwrap_or(9000)
+            ),
             Err(_) => {
                 self.sso_auth_initiated = false;
                 return Err(anyhow!("Invalid auth URL: {}", auth_url));
@@ -793,7 +809,9 @@ impl OpenVpnManager {
     async fn save_credentials_after_connect(&self) {
         info!(
             "save_credentials_after_connect called, auth_token={:?}, pending_auth_url={:?}",
-            self.auth_token.as_ref().map(|t| format!("{}...", &t[..t.len().min(20)])),
+            self.auth_token
+                .as_ref()
+                .map(|t| format!("{}...", &t[..t.len().min(20)])),
             self.pending_auth_url.is_some()
         );
         // Prefer auth_token if we received one from the server
