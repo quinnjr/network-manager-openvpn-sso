@@ -21,6 +21,9 @@ use url::Url;
 /// Timeout for waiting for OAuth callback
 const AUTH_TIMEOUT_SECS: u64 = 60;
 
+/// Channel type for sending the OAuth result from the callback handler
+type OAuthResultSender = Arc<tokio::sync::Mutex<Option<oneshot::Sender<Result<(String, String)>>>>>;
+
 /// Result of OAuth authentication
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -120,8 +123,14 @@ pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<(
     // Start localhost callback server
     let listener = TcpListener::bind(format!("127.0.0.1:{}", LOCAL_OAUTH_CALLBACK_PORT))
         .await
-        .context(format!("Failed to bind localhost:{}", LOCAL_OAUTH_CALLBACK_PORT))?;
-    info!("OAuth callback server listening on localhost:{}", LOCAL_OAUTH_CALLBACK_PORT);
+        .context(format!(
+            "Failed to bind localhost:{}",
+            LOCAL_OAUTH_CALLBACK_PORT
+        ))?;
+    info!(
+        "OAuth callback server listening on localhost:{}",
+        LOCAL_OAUTH_CALLBACK_PORT
+    );
 
     let server_base_owned = server_base_url.to_string();
     let callback_state = SsoCallbackState {
@@ -162,13 +171,10 @@ pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<(
     info!("SSO Login URL: {}", auth_url);
 
     // Wait for the callback with timeout (120 seconds to match AUTH_PENDING timeout)
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        callback_rx,
-    )
-    .await
-    .map_err(|_| anyhow!("SSO authentication timed out after 120s"))?
-    .map_err(|_| anyhow!("SSO callback channel dropped"))??;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(120), callback_rx)
+        .await
+        .map_err(|_| anyhow!("SSO authentication timed out after 120s"))?
+        .map_err(|_| anyhow!("SSO callback channel dropped"))??;
 
     let (code, state) = result;
     info!("Received OAuth callback with state: {}", state);
@@ -178,7 +184,8 @@ pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<(
     info!("Forwarding auth code to VPN server: {}", complete_url);
 
     let http_client = reqwest::Client::new();
-    let response = http_client.post(&complete_url)
+    let response = http_client
+        .post(&complete_url)
         .json(&serde_json::json!({
             "code": code,
             "state": state,
@@ -206,7 +213,7 @@ pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<(
 
 /// Shared state for the SSO callback handler
 struct SsoCallbackState {
-    result_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<Result<(String, String)>>>>>,
+    result_tx: OAuthResultSender,
 }
 
 /// Query parameters from Google's OAuth redirect
@@ -223,10 +230,16 @@ async fn handle_sso_callback(
     State(state): State<Arc<SsoCallbackState>>,
     Query(params): Query<SsoCallbackParams>,
 ) -> impl IntoResponse {
-    debug!("Received OAuth callback on localhost: code={}, state={}, error={:?}",
-        params.code.as_deref().map(|c| &c[..c.len().min(10)]).unwrap_or("none"),
+    debug!(
+        "Received OAuth callback on localhost: code={}, state={}, error={:?}",
+        params
+            .code
+            .as_deref()
+            .map(|c| &c[..c.len().min(10)])
+            .unwrap_or("none"),
         params.state.as_deref().unwrap_or("none"),
-        params.error);
+        params.error
+    );
 
     let tx = {
         let mut guard = state.result_tx.lock().await;
@@ -307,7 +320,10 @@ fn try_open_browser(url: &str) -> bool {
                 url,
             ]);
 
-            info!("Running: systemd-run --user --machine={}@ xdg-open {}", user, url);
+            info!(
+                "Running: systemd-run --user --machine={}@ xdg-open {}",
+                user, url
+            );
             match cmd.output() {
                 Ok(output) if output.status.success() => {
                     info!("Browser opened via systemd-run --user (using default browser)");
@@ -315,7 +331,11 @@ fn try_open_browser(url: &str) -> bool {
                 }
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    warn!("systemd-run --user failed (status {:?}): {}", output.status, stderr.trim());
+                    warn!(
+                        "systemd-run --user failed (status {:?}): {}",
+                        output.status,
+                        stderr.trim()
+                    );
                 }
                 Err(e) => {
                     warn!("systemd-run failed to execute: {}", e);
