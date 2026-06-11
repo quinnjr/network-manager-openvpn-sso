@@ -67,7 +67,7 @@ jobs:
           tar -czvf ${{ matrix.asset_name }}.tar.gz -C release .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}.tar.gz
@@ -114,7 +114,7 @@ jobs:
           mv target/debian/*.deb networkmanager-openvpn-sso_${VERSION}_amd64.deb
 
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: debian-package
           path: "*.deb"
@@ -157,7 +157,7 @@ jobs:
           mv target/generate-rpm/*.rpm networkmanager-openvpn-sso-${VERSION}-1.x86_64.rpm
 
       - name: Upload .rpm artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rpm-package
           path: "*.rpm"
@@ -200,7 +200,7 @@ jobs:
           su builder -c "makepkg -sf --noconfirm"
 
       - name: Upload package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: arch-linux-package
           path: "*.pkg.tar.zst"

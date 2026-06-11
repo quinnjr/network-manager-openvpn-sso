@@ -121,7 +121,7 @@ jobs:
         run: cargo build --release
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nm-openvpn-sso-service-linux-x86_64
           path: target/release/nm-openvpn-sso-service
