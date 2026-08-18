@@ -456,7 +456,7 @@
                         <i class="fa-solid fa-chevron-down group-open:rotate-180 transition-transform"></i>
                     </summary>
                     <div class="px-6 pb-6 text-gray-400">
-                        Yes! The plugin works with all desktop environments. On <strong>GNOME</strong>, it integrates with the network settings. On <strong>KDE Plasma</strong>, you may see a "missing support" message in the network applet—this is normal because KDE requires a separate UI plugin. The VPN still works perfectly via <code>nmcli</code> command line or the <code>nm-connection-editor</code> GUI tool.
+                        Yes! The plugin works with all desktop environments. On <strong>GNOME</strong>, it integrates with the network settings. On <strong>KDE Plasma</strong>, a native <code>plasma-nm</code> UI plugin is built automatically by <code>install.sh</code> when the KDE build dependencies (<code>extra-cmake-modules</code>, <code>qt6-base</code>, <code>networkmanager-qt</code>, <code>kio</code>, <code>ki18n</code>, <code>kcoreaddons</code>, <code>plasma-nm</code>) are present, letting you create, import, and connect VPN profiles right from Plasma's network settings and system tray applet. If those dependencies weren't available at install time, the applet falls back to a "missing support" message—install the KDE dependencies and re-run <code>install.sh</code> to add the plugin, or use <code>nmcli</code> command line or the <code>nm-connection-editor</code> GUI tool in the meantime.
                     </div>
                 </details>
                 
@@ -466,7 +466,7 @@
                         <i class="fa-solid fa-chevron-down group-open:rotate-180 transition-transform"></i>
                     </summary>
                     <div class="px-6 pb-6 text-gray-400">
-                        This is expected behavior. KDE's network applet requires a separate UI plugin for each VPN type. Your VPN works fine—just use <code>nmcli connection up "your-vpn-name"</code> to connect, or install <code>nm-connection-editor</code> for a GUI. You can also create a desktop shortcut for one-click VPN connection.
+                        This means the native <code>plasma-nm</code> UI plugin wasn't built during installation, usually because one or more KDE dependencies (<code>extra-cmake-modules</code>, <code>qt6-base</code>, <code>networkmanager-qt</code>, <code>kio</code>, <code>ki18n</code>, <code>kcoreaddons</code>, <code>plasma-nm</code>) were missing at install time. Install those dependencies and re-run <code>install.sh</code> to build and install the plugin—Plasma's network settings and system tray applet will then support creating, importing, and connecting to VPN profiles directly. In the meantime, your VPN still works fine—just use <code>nmcli connection up "your-vpn-name"</code> to connect, or install <code>nm-connection-editor</code> for a GUI. You can also create a desktop shortcut for one-click VPN connection.
                     </div>
                 </details>
                 

@@ -659,11 +659,6 @@ impl OpenVpnManager {
                 info!("Using cached credentials");
                 return self.send_credentials(writer, &tokens.access_token).await;
             }
-
-            // TODO: Implement token refresh if we have a refresh token
-            if tokens.can_refresh() {
-                info!("Cached token expired, would refresh here");
-            }
         }
 
         // No valid cached credentials, need to do browser auth
@@ -974,6 +969,139 @@ fn escape_management_string(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- extract_auth_url -------------------------------------------------
+
+    #[test]
+    fn extract_auth_url_finds_web_auth_double_colon_url() {
+        let msg = "WEB_AUTH::http://example.com/auth/start?state=abc flags,more";
+        assert_eq!(
+            extract_auth_url(msg),
+            Some("http://example.com/auth/start?state=abc".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_auth_url_finds_open_url_from_auth_pending_state() {
+        let msg = "timeout 120,OPEN_URL:http://34.214.23.25:9000/auth/start?state=xyz";
+        assert_eq!(
+            extract_auth_url(msg),
+            Some("http://34.214.23.25:9000/auth/start?state=xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_auth_url_finds_crv1_challenge_url() {
+        let msg = "CRV1:R,E:1234567890:someuser:Please authenticate at http://example.com/verify";
+        assert_eq!(
+            extract_auth_url(msg),
+            Some("http://example.com/verify".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_auth_url_finds_bare_url_in_message() {
+        let msg = "AUTH_PENDING please visit https://sso.example.com/login now";
+        assert_eq!(
+            extract_auth_url(msg),
+            Some("https://sso.example.com/login".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_auth_url_returns_none_when_no_url_present() {
+        let msg = "Verification Failed: no url in this message at all";
+        assert_eq!(extract_auth_url(msg), None);
+    }
+
+    // -- extract_open_url ---------------------------------------------------
+
+    #[test]
+    fn extract_open_url_stops_at_comma() {
+        let msg = "timeout 120,OPEN_URL:http://host:9000/auth,ping 10";
+        assert_eq!(
+            extract_open_url(msg),
+            Some("http://host:9000/auth".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_open_url_returns_none_when_absent() {
+        let msg = "timeout 120,no url here";
+        assert_eq!(extract_open_url(msg), None);
+    }
+
+    // -- extract_auth_token --------------------------------------------------
+
+    #[test]
+    fn extract_auth_token_handles_auth_token_colon_format() {
+        let msg = "AUTH_TOKEN:abc123XYZ";
+        assert_eq!(
+            extract_auth_token(msg),
+            Some("abc123XYZ".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_auth_token_handles_auth_token_colon_format_case_insensitively() {
+        let msg = "auth_token:lowerCaseToken";
+        assert_eq!(
+            extract_auth_token(msg),
+            Some("lowerCaseToken".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_auth_token_handles_push_reply_comma_format() {
+        let msg = "PUSH_REPLY,dhcp-option DNS 1.2.3.4,auth-token,SESS_ID_AT_abcdef,ping 10";
+        assert_eq!(
+            extract_auth_token(msg),
+            Some("SESS_ID_AT_abcdef".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_auth_token_handles_cr_response_format() {
+        let msg = "CR_RESPONSE:sometokenvalue";
+        assert_eq!(
+            extract_auth_token(msg),
+            Some("sometokenvalue".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_auth_token_returns_none_when_no_token_present() {
+        let msg = "just a regular log message with no token";
+        assert_eq!(extract_auth_token(msg), None);
+    }
+
+    // -- escape_management_string --------------------------------------------
+
+    #[test]
+    fn escape_management_string_escapes_quotes_and_backslashes() {
+        // input contains a literal backslash followed by a double quote
+        let input = "foo\"bar\\baz";
+        let expected = "foo\\\"bar\\\\baz";
+        assert_eq!(escape_management_string(input), expected);
+    }
+
+    #[test]
+    fn escape_management_string_escapes_newlines() {
+        let input = "line1\nline2";
+        let expected = "line1\\nline2";
+        assert_eq!(escape_management_string(input), expected);
+    }
+
+    #[test]
+    fn escape_management_string_leaves_plain_text_unchanged() {
+        let input = "plain-token-123";
+        assert_eq!(escape_management_string(input), input);
+    }
 }
 
 impl Drop for OpenVpnManager {

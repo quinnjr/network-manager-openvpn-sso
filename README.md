@@ -10,7 +10,7 @@ A NetworkManager VPN plugin that adds OAuth 2.0 / OIDC Single Sign-On (SSO) supp
 
 - **Browser-based SSO authentication** - Opens your default browser for OAuth/OIDC login
 - **Automatic OAuth discovery** - Discovers authentication URLs from the OpenVPN server
-- **Session token caching** - Caches session tokens for connection maintenance
+- **Session token caching** - Caches session tokens (via Secret Service, with an encrypted-file fallback) for up to 24 hours, so reconnecting doesn't always require a fresh browser SSO round-trip
 - **Desktop notifications** - Shows connection status via system notifications
 - **Full NetworkManager integration** - Works seamlessly with NetworkManager and network applets
 
@@ -143,7 +143,7 @@ sudo ./uninstall.sh
 
 ## Configuration
 
-The plugin stores session tokens in `/var/lib/nm-openvpn-sso/` with restricted permissions. These tokens are used for session maintenance but do not persist across new connection attempts (SSO is required for each new connection).
+After a successful login, the plugin caches the session token — preferring the Secret Service keyring, and falling back to `/var/lib/nm-openvpn-sso/` (mode `0700` directory, `0600` file) when a keyring isn't available (e.g. running as root under NetworkManager). The cached token is valid for up to 24 hours: on a subsequent connection attempt, if a valid cached token exists it is sent to the server directly and the browser is not opened; full browser-based SSO only runs again once the cached token has expired or no cached token exists. Security tradeoff: this means a cached token lets anyone able to trigger a reconnect on that machine connect without re-authenticating for up to 24 hours, which is why the cache is kept in the keyring where possible and restricted to owner-only permissions otherwise.
 
 ## Troubleshooting
 
@@ -151,8 +151,9 @@ The plugin stores session tokens in `/var/lib/nm-openvpn-sso/` with restricted p
 
 Ensure you have a default browser set and that `xdg-open` or your browser is accessible. The plugin will try multiple methods to open the browser:
 
-1. `xdg-open` (skipped on KDE due to KIO limitations)
-2. Direct browser launch (vivaldi, firefox, chromium, google-chrome)
+1. `xdg-open` run in the user's session via `systemd-run --user`
+2. `xdg-open` run via `runuser -u <user>` if the above fails
+3. A direct browser launch via `runuser -u <user>`, trying in order: `vivaldi-stable`, `vivaldi`, `firefox`, `chromium`, `google-chrome-stable`, `brave`
 
 ### Connection times out
 

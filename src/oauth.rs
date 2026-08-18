@@ -292,18 +292,12 @@ fn try_open_browser(url: &str) -> bool {
 
     info!("Attempting to open browser for URL: {}", url);
 
-    // Find the active graphical user
-    if let Some(user) = find_graphical_user() {
+    // Find the active graphical user (and their environment). This discovery is
+    // expensive (shells out to loginctl/ps and reads up to 100 /proc/<pid>/environ
+    // files), but the active graphical session rarely changes within the service's
+    // lifetime, so cache the resolved result for the lifetime of the process.
+    if let Some((user, uid, user_env)) = get_cached_graphical_session() {
         info!("Found graphical user: {}", user);
-
-        // Get the user's UID for XDG_RUNTIME_DIR
-        let uid = match get_uid_for_user(&user) {
-            Some(u) => u,
-            None => {
-                warn!("Could not get UID for user {}", user);
-                return try_fallback_browser(url);
-            }
-        };
 
         // Method 1 (preferred): Use systemd-run --user to run in the user's session scope.
         // This inherits the user's full environment (DISPLAY, WAYLAND_DISPLAY, DBUS, etc.)
@@ -345,8 +339,6 @@ fn try_open_browser(url: &str) -> bool {
 
         let xdg_runtime = format!("/run/user/{}", uid);
 
-        // Get user's environment from their processes
-        let user_env = get_user_graphical_env(&user, uid);
         info!("User graphical env: {:?}", user_env);
 
         // Method 2: Try xdg-open with user's environment via runuser
@@ -462,6 +454,42 @@ fn try_fallback_browser(url: &str) -> bool {
     }
 
     false
+}
+
+/// Cache of the discovered graphical session (user, uid, environment variables).
+///
+/// Discovery shells out to `loginctl` and scans `/proc/<pid>/environ` for up to
+/// 100 processes, which is expensive to repeat on every browser-open attempt.
+/// The active graphical session rarely changes within the service's lifetime,
+/// so we resolve it once and reuse the result. Only successful discoveries are
+/// cached - if discovery fails, we retry on the next call, since a session may
+/// appear later (e.g. the user hasn't logged in yet).
+static GRAPHICAL_SESSION: std::sync::OnceLock<(String, u32, Vec<(String, String)>)> =
+    std::sync::OnceLock::new();
+
+/// Get the active graphical user, their UID, and their graphical environment,
+/// using a cached result if one was already discovered.
+fn get_cached_graphical_session() -> Option<(String, u32, Vec<(String, String)>)> {
+    if let Some(cached) = GRAPHICAL_SESSION.get() {
+        return Some(cached.clone());
+    }
+
+    let user = find_graphical_user()?;
+
+    let uid = match get_uid_for_user(&user) {
+        Some(u) => u,
+        None => {
+            warn!("Could not get UID for user {}", user);
+            return None;
+        }
+    };
+
+    let user_env = get_user_graphical_env(&user, uid);
+
+    let discovered = (user, uid, user_env);
+    // Best-effort: if another thread raced us and set it first, just use theirs.
+    let _ = GRAPHICAL_SESSION.set(discovered.clone());
+    Some(discovered)
 }
 
 /// Find the username of an active graphical session
