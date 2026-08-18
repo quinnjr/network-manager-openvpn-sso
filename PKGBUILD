@@ -11,6 +11,9 @@ makedepends=('cargo' 'rust' 'extra-cmake-modules' 'qt6-base' 'networkmanager-qt'
 optdepends=('plasma-nm: KDE Plasma network manager integration')
 provides=('networkmanager-openvpn-sso')
 conflicts=('networkmanager-openvpn-sso-git')
+# !lto: makepkg's -flto CFLAGS produce GCC bitcode objects for ring's C code
+# that rust's lld cannot link (undefined ring_core_* symbols)
+options=('!lto')
 source=()
 sha256sums=()
 
