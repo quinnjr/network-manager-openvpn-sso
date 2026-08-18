@@ -12,6 +12,8 @@
 
 #include <QFile>
 #include <QFileInfo>
+#include <QRegularExpression>
+#include <QStringList>
 
 extern "C" {
 #include <NetworkManager.h>
@@ -46,6 +48,10 @@ QStringList OpenVpnSsoUiPlugin::supportedFileExtensions() const
     return {QStringLiteral("*.ovpn"), QStringLiteral("*.conf")};
 }
 
+// Import deliberately stores only the source config-file path under the "config" data key.
+// Field extraction (remote/port/proto) is deferred to the Rust service (src/config.rs) at
+// connect time, and the widget's gateway/port/protocol fields are optional user overrides
+// layered on top of that file — parsing them out here would be redundant.
 VpnUiPlugin::ImportResult OpenVpnSsoUiPlugin::importConnectionSettings(const QString &fileName)
 {
     if (!QFile::exists(fileName)) {
@@ -96,13 +102,120 @@ VpnUiPlugin::ExportResult OpenVpnSsoUiPlugin::exportConnectionSettings(
         return ExportResult::fail(i18n("Source configuration file not found: %1", configPath));
     }
 
-    // Copy the original .ovpn file to the export location
+    QFile sourceFile(configPath);
+    if (!sourceFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return ExportResult::fail(i18n("Failed to read configuration file: %1", configPath));
+    }
+    const QString sourceContents = QString::fromUtf8(sourceFile.readAll());
+    sourceFile.close();
+
+    // Gateway/port/protocol overrides stashed by OpenVpnSsoSettingWidget::setting().
+    const QString remoteOverride = data.value(QStringLiteral("remote"));
+    const QString portOverride = data.value(QStringLiteral("port"));
+    const QString protoOverride = data.value(QStringLiteral("proto"));
+
+    QString outputContents = sourceContents;
+
+    if (!remoteOverride.isEmpty() || !portOverride.isEmpty() || !protoOverride.isEmpty()) {
+        QStringList lines = sourceContents.split(QLatin1Char('\n'));
+
+        int remoteLineIdx = -1;
+        int portLineIdx = -1;
+        int protoLineIdx = -1;
+
+        static const QRegularExpression keywordRe(QStringLiteral("^\\s*(\\S+)"));
+        static const QRegularExpression whitespaceRe(QStringLiteral("\\s+"));
+
+        for (int i = 0; i < lines.size(); ++i) {
+            const QString trimmed = lines.at(i).trimmed();
+            if (trimmed.isEmpty() || trimmed.startsWith(QLatin1Char('#')) || trimmed.startsWith(QLatin1Char(';'))) {
+                continue;
+            }
+            const QRegularExpressionMatch match = keywordRe.match(trimmed);
+            if (!match.hasMatch()) {
+                continue;
+            }
+            const QString keyword = match.captured(1);
+            if (keyword == QLatin1String("remote") && remoteLineIdx < 0) {
+                remoteLineIdx = i;
+            } else if (keyword == QLatin1String("port") && portLineIdx < 0) {
+                portLineIdx = i;
+            } else if (keyword == QLatin1String("proto") && protoLineIdx < 0) {
+                protoLineIdx = i;
+            }
+        }
+
+        // "remote" accepts an optional embedded port and protocol: "remote <host> [port] [proto]".
+        QString remoteHost;
+        QString remotePort;
+        QString remoteProto;
+        if (remoteLineIdx >= 0) {
+            const QStringList tokens = lines.at(remoteLineIdx).trimmed().split(whitespaceRe, Qt::SkipEmptyParts);
+            if (tokens.size() > 1) {
+                remoteHost = tokens.at(1);
+            }
+            if (tokens.size() > 2) {
+                remotePort = tokens.at(2);
+            }
+            if (tokens.size() > 3) {
+                remoteProto = tokens.at(3);
+            }
+        }
+
+        if (!remoteOverride.isEmpty()) {
+            remoteHost = remoteOverride;
+        }
+        // Only fold the port/proto override into the remote line if the source already used
+        // that embedded form there; otherwise it belongs on a standalone directive below.
+        if (!portOverride.isEmpty() && remoteLineIdx >= 0 && !remotePort.isEmpty()) {
+            remotePort = portOverride;
+        }
+        if (!protoOverride.isEmpty() && remoteLineIdx >= 0 && !remoteProto.isEmpty()) {
+            remoteProto = protoOverride;
+        }
+
+        if (remoteLineIdx >= 0) {
+            QString newRemoteLine = QStringLiteral("remote %1").arg(remoteHost);
+            if (!remotePort.isEmpty()) {
+                newRemoteLine += QLatin1Char(' ') + remotePort;
+            }
+            if (!remoteProto.isEmpty()) {
+                newRemoteLine += QLatin1Char(' ') + remoteProto;
+            }
+            lines[remoteLineIdx] = newRemoteLine;
+        } else if (!remoteOverride.isEmpty()) {
+            lines.append(QStringLiteral("remote %1").arg(remoteOverride));
+        }
+
+        if (!portOverride.isEmpty() && remotePort != portOverride) {
+            if (portLineIdx >= 0) {
+                lines[portLineIdx] = QStringLiteral("port %1").arg(portOverride);
+            } else {
+                lines.append(QStringLiteral("port %1").arg(portOverride));
+            }
+        }
+
+        if (!protoOverride.isEmpty() && remoteProto != protoOverride) {
+            if (protoLineIdx >= 0) {
+                lines[protoLineIdx] = QStringLiteral("proto %1").arg(protoOverride);
+            } else {
+                lines.append(QStringLiteral("proto %1").arg(protoOverride));
+            }
+        }
+
+        outputContents = lines.join(QLatin1Char('\n'));
+    }
+
     if (QFile::exists(fileName)) {
         QFile::remove(fileName);
     }
-    if (!QFile::copy(configPath, fileName)) {
-        return ExportResult::fail(i18n("Failed to copy configuration to: %1", fileName));
+
+    QFile destFile(fileName);
+    if (!destFile.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        return ExportResult::fail(i18n("Failed to write configuration to: %1", fileName));
     }
+    destFile.write(outputContents.toUtf8());
+    destFile.close();
 
     return ExportResult::pass();
 }

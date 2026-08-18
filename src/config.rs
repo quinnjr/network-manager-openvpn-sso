@@ -28,7 +28,10 @@ pub struct ConnectionConfig {
     pub username: Option<String>,
     /// Password for initial auth (placeholder for SSO)
     pub password: Option<String>,
-    /// Additional OpenVPN arguments
+    /// Additional OpenVPN arguments. Not populated by `from_nm_settings` — no
+    /// NetworkManager setting is mapped to this field today. It exists for
+    /// programmatic use (e.g. callers constructing a `ConnectionConfig`
+    /// directly) rather than end-user configuration via NM.
     pub extra_args: Vec<String>,
     /// CA certificate path (from vpn.data "ca")
     pub ca: Option<String>,
@@ -286,4 +289,244 @@ fn get_string_dict(
             Some(result)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `connection` settings section with the given uuid/id.
+    fn connection_section(uuid: &str, id: &str) -> HashMap<String, OwnedValue> {
+        use zbus::zvariant::Str;
+
+        let mut connection = HashMap::new();
+        connection.insert(
+            "uuid".to_string(),
+            OwnedValue::from(Str::from(uuid.to_string())),
+        );
+        connection.insert(
+            "id".to_string(),
+            OwnedValue::from(Str::from(id.to_string())),
+        );
+        connection
+    }
+
+    /// Build a `vpn` settings section whose `data` key is a string->string
+    /// dict built from `data`, matching the shape NetworkManager sends over
+    /// D-Bus (a{sv} with a nested a{ss} for "data").
+    fn vpn_section(data: &[(&str, &str)]) -> HashMap<String, OwnedValue> {
+        let data_map: HashMap<String, String> = data
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut vpn = HashMap::new();
+        vpn.insert("data".to_string(), OwnedValue::from(data_map));
+        vpn
+    }
+
+    fn settings_with(
+        connection: HashMap<String, OwnedValue>,
+        vpn: HashMap<String, OwnedValue>,
+    ) -> HashMap<String, HashMap<String, OwnedValue>> {
+        let mut settings = HashMap::new();
+        settings.insert("connection".to_string(), connection);
+        settings.insert("vpn".to_string(), vpn);
+        settings
+    }
+
+    #[test]
+    fn from_nm_settings_config_file_mode_with_required_keys() {
+        let connection = connection_section(
+            "11111111-1111-1111-1111-111111111111",
+            "Test Connection",
+        );
+        let vpn = vpn_section(&[
+            ("config", "/etc/openvpn/client/test.ovpn"),
+            ("remote", "vpn.example.com:1194"),
+            ("proto", "udp"),
+        ]);
+        let settings = settings_with(connection, vpn);
+
+        let config = ConnectionConfig::from_nm_settings(&settings)
+            .expect("config-file based settings should parse");
+
+        assert_eq!(config.uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(config.id, "Test Connection");
+        assert_eq!(
+            config.config_path,
+            Some(PathBuf::from("/etc/openvpn/client/test.ovpn"))
+        );
+        assert_eq!(config.remote, Some("vpn.example.com:1194".to_string()));
+        assert_eq!(config.protocol, Some("udp".to_string()));
+        assert!(config.extra_args.is_empty());
+        assert!(config.ca.is_none());
+    }
+
+    #[test]
+    fn from_nm_settings_missing_required_keys_errors() {
+        // No "config" and no "ca" in vpn.data — from_nm_settings should
+        // reject this as there's no way to build an OpenVPN invocation.
+        let connection = connection_section(
+            "22222222-2222-2222-2222-222222222222",
+            "Broken Connection",
+        );
+        let vpn = vpn_section(&[("remote", "vpn.example.com:1194")]);
+        let settings = settings_with(connection, vpn);
+
+        let result = ConnectionConfig::from_nm_settings(&settings);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Missing OpenVPN config"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn from_nm_settings_missing_connection_section_errors() {
+        let vpn = vpn_section(&[("config", "/etc/openvpn/client/test.ovpn")]);
+        let mut settings = HashMap::new();
+        settings.insert("vpn".to_string(), vpn);
+
+        let result = ConnectionConfig::from_nm_settings(&settings);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Missing 'connection' settings section"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn from_nm_settings_nm_imported_mode_with_ca() {
+        // No "config" key, but a "ca" key satisfies the required-keys check
+        // and puts the config in NM-imported (individual settings) mode.
+        let connection = connection_section(
+            "33333333-3333-3333-3333-333333333333",
+            "Imported Connection",
+        );
+        let vpn = vpn_section(&[
+            ("ca", "/etc/openvpn/client/ca.crt"),
+            ("cert", "/etc/openvpn/client/client.crt"),
+            ("key", "/etc/openvpn/client/client.key"),
+            ("dev", "tun"),
+        ]);
+        let settings = settings_with(connection, vpn);
+
+        let config = ConnectionConfig::from_nm_settings(&settings)
+            .expect("NM-imported settings with ca should parse");
+
+        assert!(config.config_path.is_none());
+        assert_eq!(config.ca, Some("/etc/openvpn/client/ca.crt".to_string()));
+        assert_eq!(
+            config.cert,
+            Some("/etc/openvpn/client/client.crt".to_string())
+        );
+        assert_eq!(config.dev, Some("tun".to_string()));
+    }
+
+    #[test]
+    fn build_openvpn_args_config_file_mode() {
+        let config = ConnectionConfig {
+            uuid: "uuid".to_string(),
+            id: "id".to_string(),
+            config_path: Some(PathBuf::from("/etc/openvpn/client/test.ovpn")),
+            remote: None,
+            port: None,
+            protocol: None,
+            username: None,
+            password: None,
+            extra_args: Vec::new(),
+            ca: None,
+            cert: None,
+            key: None,
+            ta: None,
+            ta_dir: None,
+            cipher: None,
+            auth: None,
+            dev: None,
+            remote_cert_tls: None,
+            connection_type: None,
+        };
+
+        let args = config.build_openvpn_args("/run/user/1000/openvpn-sso.sock");
+
+        assert_eq!(args[0], "--config");
+        assert_eq!(args[1], "/etc/openvpn/client/test.ovpn");
+        assert!(!args.iter().any(|a| a == "--client"));
+
+        let mgmt_idx = args
+            .iter()
+            .position(|a| a == "--management")
+            .expect("--management flag should be present");
+        assert_eq!(args[mgmt_idx + 1], "/run/user/1000/openvpn-sso.sock");
+        assert_eq!(args[mgmt_idx + 2], "unix");
+        assert!(args.iter().any(|a| a == "--management-query-passwords"));
+        assert!(args.iter().any(|a| a == "--management-hold"));
+        assert!(args.iter().any(|a| a == "--script-security"));
+    }
+
+    #[test]
+    fn build_openvpn_args_nm_imported_mode() {
+        let config = ConnectionConfig {
+            uuid: "uuid".to_string(),
+            id: "id".to_string(),
+            config_path: None,
+            remote: Some("vpn.example.com:1194".to_string()),
+            port: None,
+            protocol: Some("udp".to_string()),
+            username: None,
+            password: None,
+            extra_args: vec!["--verb".to_string(), "3".to_string()],
+            ca: Some("/etc/openvpn/client/ca.crt".to_string()),
+            cert: Some("/etc/openvpn/client/client.crt".to_string()),
+            key: Some("/etc/openvpn/client/client.key".to_string()),
+            ta: Some("/etc/openvpn/client/ta.key".to_string()),
+            ta_dir: Some("1".to_string()),
+            cipher: Some("AES-256-GCM".to_string()),
+            auth: Some("SHA256".to_string()),
+            dev: Some("tun".to_string()),
+            remote_cert_tls: Some("server".to_string()),
+            connection_type: Some("tls".to_string()),
+        };
+
+        let args = config.build_openvpn_args("/run/user/1000/openvpn-sso.sock");
+
+        assert!(args.iter().any(|a| a == "--client"));
+        assert!(!args.iter().any(|a| a == "--config"));
+
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--ca" && w[1] == "/etc/openvpn/client/ca.crt"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--cert" && w[1] == "/etc/openvpn/client/client.crt"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--key" && w[1] == "/etc/openvpn/client/client.key"));
+        assert!(args.windows(3).any(|w| w[0] == "--tls-auth"
+            && w[1] == "/etc/openvpn/client/ta.key"
+            && w[2] == "1"));
+
+        let mgmt_idx = args
+            .iter()
+            .position(|a| a == "--management")
+            .expect("--management flag should be present");
+        assert_eq!(args[mgmt_idx + 1], "/run/user/1000/openvpn-sso.sock");
+        assert_eq!(args[mgmt_idx + 2], "unix");
+        assert!(args.iter().any(|a| a == "--management-query-passwords"));
+        assert!(args.iter().any(|a| a == "--management-hold"));
+
+        // "host:port" remote is split into --remote host port
+        assert!(args
+            .windows(3)
+            .any(|w| w[0] == "--remote" && w[1] == "vpn.example.com" && w[2] == "1194"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--proto" && w[1] == "udp"));
+
+        // extra_args are appended at the end
+        assert_eq!(args[args.len() - 2], "--verb");
+        assert_eq!(args[args.len() - 1], "3");
+    }
 }

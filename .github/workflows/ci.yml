@@ -158,6 +158,34 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
 
+  plasma-plugin:
+    name: Plasma Plugin Build
+    runs-on: ubuntu-latest
+    # KF6 plasma-nm is not packaged on ubuntu-latest; build in Arch, matching PKGBUILD makedepends
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install KDE build dependencies
+        run: |
+          pacman -Syu --noconfirm \
+            cmake \
+            extra-cmake-modules \
+            qt6-base \
+            networkmanager-qt \
+            kio \
+            ki18n \
+            kcoreaddons \
+            plasma-nm \
+            libnm \
+            pkgconf
+
+      - name: Configure plasma-nm plugin
+        run: cmake -B plasma-nm-plugin/build -S plasma-nm-plugin
+
+      - name: Build plasma-nm plugin
+        run: cmake --build plasma-nm-plugin/build
+
   security-audit:
     name: Security Audit
     runs-on: ubuntu-latest

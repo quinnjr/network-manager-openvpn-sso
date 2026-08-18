@@ -13,7 +13,6 @@ use zbus::{interface, Connection};
 
 use crate::config::ConnectionConfig;
 use crate::openvpn::{OpenVpnManager, VpnEvent, VpnState};
-use crate::secrets;
 
 /// D-Bus service name
 const SERVICE_NAME: &str = "org.freedesktop.NetworkManager.openvpn-sso";
@@ -195,16 +194,8 @@ impl VpnPlugin {
             config.uuid, config.id, config.config_path, config.ca
         );
 
-        // Check if we have cached credentials
-        if let Some(tokens) = secrets::get_cached_credentials(&config.uuid).await {
-            if tokens.is_valid() {
-                debug!("Have valid cached credentials, no secrets needed");
-                return Ok(String::new());
-            }
-        }
-
-        // We handle auth ourselves via browser, so we don't need NM to prompt
-        // Return empty string = no secrets needed from NM's perspective
+        // Auth is handled entirely via browser SSO, so we never ask NM to
+        // prompt for secrets. Return empty string = no secrets needed.
         Ok(String::new())
     }
 
@@ -227,6 +218,14 @@ impl VpnPlugin {
 
         Ok(())
     }
+
+    // The following methods (set_config, set_ip4_config, set_ip6_config,
+    // new_secrets, set_failure) are required by the
+    // org.freedesktop.NetworkManager.VPN.Plugin D-Bus interface, but are
+    // intentionally no-ops here: this plugin parses OpenVPN's own output
+    // and emits Config/Ip4Config/Failure as outbound signals itself (see
+    // emit_config/emit_ip4_config/emit_failure below in this file), rather
+    // than relying on an external helper calling back into these methods.
 
     /// Set generic configuration
     async fn set_config(&self, _config: HashMap<String, OwnedValue>) -> zbus::fdo::Result<()> {

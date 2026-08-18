@@ -21,10 +21,6 @@ PREFIX="${PREFIX:-/usr}"
 LIBDIR="${LIBDIR:-$PREFIX/lib}"
 SYSCONFDIR="${SYSCONFDIR:-/etc}"
 
-info "Stopping service..."
-systemctl stop nm-openvpn-sso.service 2>/dev/null || true
-systemctl disable nm-openvpn-sso.service 2>/dev/null || true
-
 info "Removing files..."
 rm -f "$LIBDIR/nm-openvpn-sso-service"
 rm -f "$LIBDIR/NetworkManager/VPN/nm-openvpn-sso-service.name"
