@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22...4.2)
-project(plasmanetworkmanagement_openvpnssoui VERSION 0.2.0)
+project(plasmanetworkmanagement_openvpnssoui VERSION 0.3.1)
 
 # Required for CMake 4.x + Qt6 compatibility
 set(QT_DEFAULT_MAJOR_VERSION 6)
