@@ -41,8 +41,8 @@ plasma-nm-plugin/
     "KPlugin": {
         "Authors": [
             {
-                "Email": "pegasusheavyindustries@gmail.com",
-                "Name": "Pegasus Heavy Industries LLC"
+                "Email": "quinn.josephr@protonmail.com",
+                "Name": "Joseph R. Quinn"
             }
         ],
         "Category": "VPNService",
@@ -52,7 +52,7 @@ plasma-nm-plugin/
         "License": "MIT",
         "Name": "OpenVPN SSO",
         "Version": "0.1.0",
-        "Website": "https://github.com/pegasusheavy/network-manager-openvpn-sso"
+        "Website": "https://github.com/quinnjr/network-manager-openvpn-sso"
     },
     "X-NetworkManager-Services": "org.freedesktop.NetworkManager.openvpn-sso"
 }
@@ -275,7 +275,7 @@ git commit -m "feat(plasma): add Qt Designer UI form for VPN configuration"
 
 ```cpp
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Pegasus Heavy Industries LLC
+// Copyright (c) 2026 Joseph R. Quinn
 
 #ifndef PLASMANM_OPENVPNSSO_WIDGET_H
 #define PLASMANM_OPENVPNSSO_WIDGET_H
@@ -310,7 +310,7 @@ private:
 
 ```cpp
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Pegasus Heavy Industries LLC
+// Copyright (c) 2026 Joseph R. Quinn
 
 #include "openvpnssowidget.h"
 #include "ui_openvpnsso.h"
@@ -440,7 +440,7 @@ git commit -m "feat(plasma): add VPN configuration widget"
 
 ```cpp
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Pegasus Heavy Industries LLC
+// Copyright (c) 2026 Joseph R. Quinn
 
 #ifndef PLASMANM_OPENVPNSSO_AUTH_H
 #define PLASMANM_OPENVPNSSO_AUTH_H
@@ -469,7 +469,7 @@ The auth widget is intentionally minimal - SSO auth happens in the browser, not 
 
 ```cpp
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Pegasus Heavy Industries LLC
+// Copyright (c) 2026 Joseph R. Quinn
 
 #include "openvpnssoauth.h"
 
@@ -524,7 +524,7 @@ git commit -m "feat(plasma): add SSO auth widget (informational, browser-based)"
 
 ```cpp
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Pegasus Heavy Industries LLC
+// Copyright (c) 2026 Joseph R. Quinn
 
 #ifndef PLASMANM_OPENVPNSSO_H
 #define PLASMANM_OPENVPNSSO_H
@@ -555,7 +555,7 @@ public:
 
 ```cpp
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Pegasus Heavy Industries LLC
+// Copyright (c) 2026 Joseph R. Quinn
 
 #include "openvpnsso.h"
 #include "openvpnssowidget.h"

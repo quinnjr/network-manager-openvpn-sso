@@ -2,8 +2,8 @@
     "KPlugin": {
         "Authors": [
             {
-                "Email": "pegasusheavyindustries@gmail.com",
-                "Name": "Pegasus Heavy Industries LLC"
+                "Email": "quinn.josephr@protonmail.com",
+                "Name": "Joseph R. Quinn"
             }
         ],
         "Category": "VPNService",
@@ -13,7 +13,7 @@
         "License": "MIT",
         "Name": "OpenVPN SSO",
         "Version": "0.2.0",
-        "Website": "https://github.com/pegasusheavy/network-manager-openvpn-sso"
+        "Website": "https://github.com/quinnjr/network-manager-openvpn-sso"
     },
     "X-NetworkManager-Services": "org.freedesktop.NetworkManager.openvpn-sso"
 }

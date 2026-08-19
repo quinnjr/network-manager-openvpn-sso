@@ -6,8 +6,8 @@ NetworkManager OpenVPN SSO enables browser-based SSO authentication for OpenVPN 
 
 ## Links
 
-- [Documentation](https://pegasusheavy.github.io/network-manager-openvpn-sso/)
-- [GitHub Repository](https://github.com/pegasusheavy/network-manager-openvpn-sso)
+- [Documentation](https://quinnjr.github.io/network-manager-openvpn-sso/)
+- [GitHub Repository](https://github.com/quinnjr/network-manager-openvpn-sso)
 
 ## Key Features
 
@@ -30,7 +30,7 @@ sudo dpkg -i networkmanager-openvpn-sso_*_amd64.deb
 sudo apt-get install -f
 
 # From source
-git clone https://github.com/pegasusheavy/network-manager-openvpn-sso.git
+git clone https://github.com/quinnjr/network-manager-openvpn-sso.git
 cd network-manager-openvpn-sso
 cargo build --release
 sudo ./install.sh

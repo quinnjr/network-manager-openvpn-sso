@@ -1,10 +1,10 @@
-# Maintainer: Pegasus Heavy Industries LLC <pegasusheavyindustries@gmail.com>
+# Maintainer: Joseph R. Quinn <quinn.josephr@protonmail.com>
 pkgname=networkmanager-openvpn-sso
 pkgver=0.3.1
 pkgrel=1
 pkgdesc="NetworkManager VPN plugin for OpenVPN with SSO/OAuth authentication"
 arch=('x86_64')
-url="https://github.com/pegasusheavy/network-manager-openvpn-sso"
+url="https://github.com/quinnjr/network-manager-openvpn-sso"
 license=('MIT')
 depends=('networkmanager' 'openvpn' 'libsecret' 'dbus')
 makedepends=('cargo' 'rust' 'extra-cmake-modules' 'qt6-base' 'networkmanager-qt' 'kio' 'ki18n' 'kcoreaddons')

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Pegasus Heavy Industries LLC
+// Copyright (c) 2026 Joseph R. Quinn
 
 //! Secure token storage using the system keyring (libsecret/Secret Service)
 //! with fallback to encrypted file storage when keyring is unavailable
