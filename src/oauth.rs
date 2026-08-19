@@ -456,6 +456,9 @@ fn try_fallback_browser(url: &str) -> bool {
     false
 }
 
+/// A discovered graphical session: (username, uid, environment variables).
+type GraphicalSession = (String, u32, Vec<(String, String)>);
+
 /// Cache of the discovered graphical session (user, uid, environment variables).
 ///
 /// Discovery shells out to `loginctl` and scans `/proc/<pid>/environ` for up to
@@ -464,12 +467,11 @@ fn try_fallback_browser(url: &str) -> bool {
 /// so we resolve it once and reuse the result. Only successful discoveries are
 /// cached - if discovery fails, we retry on the next call, since a session may
 /// appear later (e.g. the user hasn't logged in yet).
-static GRAPHICAL_SESSION: std::sync::OnceLock<(String, u32, Vec<(String, String)>)> =
-    std::sync::OnceLock::new();
+static GRAPHICAL_SESSION: std::sync::OnceLock<GraphicalSession> = std::sync::OnceLock::new();
 
 /// Get the active graphical user, their UID, and their graphical environment,
 /// using a cached result if one was already discovered.
-fn get_cached_graphical_session() -> Option<(String, u32, Vec<(String, String)>)> {
+fn get_cached_graphical_session() -> Option<GraphicalSession> {
     if let Some(cached) = GRAPHICAL_SESSION.get() {
         return Some(cached.clone());
     }

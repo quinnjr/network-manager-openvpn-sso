@@ -336,10 +336,8 @@ mod tests {
 
     #[test]
     fn from_nm_settings_config_file_mode_with_required_keys() {
-        let connection = connection_section(
-            "11111111-1111-1111-1111-111111111111",
-            "Test Connection",
-        );
+        let connection =
+            connection_section("11111111-1111-1111-1111-111111111111", "Test Connection");
         let vpn = vpn_section(&[
             ("config", "/etc/openvpn/client/test.ovpn"),
             ("remote", "vpn.example.com:1194"),
@@ -366,10 +364,8 @@ mod tests {
     fn from_nm_settings_missing_required_keys_errors() {
         // No "config" and no "ca" in vpn.data — from_nm_settings should
         // reject this as there's no way to build an OpenVPN invocation.
-        let connection = connection_section(
-            "22222222-2222-2222-2222-222222222222",
-            "Broken Connection",
-        );
+        let connection =
+            connection_section("22222222-2222-2222-2222-222222222222", "Broken Connection");
         let vpn = vpn_section(&[("remote", "vpn.example.com:1194")]);
         let settings = settings_with(connection, vpn);
 
@@ -504,9 +500,9 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|w| w[0] == "--key" && w[1] == "/etc/openvpn/client/client.key"));
-        assert!(args.windows(3).any(|w| w[0] == "--tls-auth"
-            && w[1] == "/etc/openvpn/client/ta.key"
-            && w[2] == "1"));
+        assert!(args
+            .windows(3)
+            .any(|w| w[0] == "--tls-auth" && w[1] == "/etc/openvpn/client/ta.key" && w[2] == "1"));
 
         let mgmt_idx = args
             .iter()
@@ -521,9 +517,7 @@ mod tests {
         assert!(args
             .windows(3)
             .any(|w| w[0] == "--remote" && w[1] == "vpn.example.com" && w[2] == "1194"));
-        assert!(args
-            .windows(2)
-            .any(|w| w[0] == "--proto" && w[1] == "udp"));
+        assert!(args.windows(2).any(|w| w[0] == "--proto" && w[1] == "udp"));
 
         // extra_args are appended at the end
         assert_eq!(args[args.len() - 2], "--verb");
