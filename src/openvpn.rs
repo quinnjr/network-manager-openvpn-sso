@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Pegasus Heavy Industries LLC
+// Copyright (c) 2026 Joseph R. Quinn
 
 //! OpenVPN process management and management interface protocol
 
@@ -1041,19 +1041,13 @@ mod tests {
     #[test]
     fn extract_auth_token_handles_auth_token_colon_format() {
         let msg = "AUTH_TOKEN:abc123XYZ";
-        assert_eq!(
-            extract_auth_token(msg),
-            Some("abc123XYZ".to_string())
-        );
+        assert_eq!(extract_auth_token(msg), Some("abc123XYZ".to_string()));
     }
 
     #[test]
     fn extract_auth_token_handles_auth_token_colon_format_case_insensitively() {
         let msg = "auth_token:lowerCaseToken";
-        assert_eq!(
-            extract_auth_token(msg),
-            Some("lowerCaseToken".to_string())
-        );
+        assert_eq!(extract_auth_token(msg), Some("lowerCaseToken".to_string()));
     }
 
     #[test]
@@ -1068,10 +1062,7 @@ mod tests {
     #[test]
     fn extract_auth_token_handles_cr_response_format() {
         let msg = "CR_RESPONSE:sometokenvalue";
-        assert_eq!(
-            extract_auth_token(msg),
-            Some("sometokenvalue".to_string())
-        );
+        assert_eq!(extract_auth_token(msg), Some("sometokenvalue".to_string()));
     }
 
     #[test]

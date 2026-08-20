@@ -2,8 +2,8 @@
 
 A NetworkManager VPN plugin that adds OAuth 2.0 / OIDC Single Sign-On (SSO) support for OpenVPN connections.
 
-[![CI](https://github.com/pegasusheavy/network-manager-openvpn-sso/actions/workflows/ci.yml/badge.svg)](https://github.com/pegasusheavy/network-manager-openvpn-sso/actions/workflows/ci.yml)
-[![Release](https://github.com/pegasusheavy/network-manager-openvpn-sso/actions/workflows/release.yml/badge.svg)](https://github.com/pegasusheavy/network-manager-openvpn-sso/actions/workflows/release.yml)
+[![CI](https://github.com/quinnjr/network-manager-openvpn-sso/actions/workflows/ci.yml/badge.svg)](https://github.com/quinnjr/network-manager-openvpn-sso/actions/workflows/ci.yml)
+[![Release](https://github.com/quinnjr/network-manager-openvpn-sso/actions/workflows/release.yml/badge.svg)](https://github.com/quinnjr/network-manager-openvpn-sso/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Features
@@ -124,7 +124,7 @@ sudo dnf install rust cargo dbus-devel openssl-devel pkg-config
 ### Build
 
 ```bash
-git clone https://github.com/pegasusheavy/network-manager-openvpn-sso.git
+git clone https://github.com/quinnjr/network-manager-openvpn-sso.git
 cd network-manager-openvpn-sso
 cargo build --release
 ```
@@ -202,9 +202,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Support
 
-- [GitHub Issues](https://github.com/pegasusheavy/network-manager-openvpn-sso/issues)
-- [Patreon](https://www.patreon.com/c/PegasusHeavyIndustries)
+- [GitHub Issues](https://github.com/quinnjr/network-manager-openvpn-sso/issues)
 
 ---
 
-Made with ❤️ by [Pegasus Heavy Industries LLC](https://github.com/pegasusheavy)
+Made with ❤️ by [Joseph R. Quinn](https://github.com/quinnjr)

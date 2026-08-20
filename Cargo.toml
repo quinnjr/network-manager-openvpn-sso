@@ -2,11 +2,11 @@
 name = "nm-openvpn-sso"
 version = "0.3.1"
 edition = "2021"
-authors = ["Pegasus Heavy Industries LLC <pegasusheavyindustries@gmail.com>"]
+authors = ["Joseph R. Quinn <quinn.josephr@protonmail.com>"]
 license = "MIT"
 description = "NetworkManager VPN plugin for OpenVPN with SSO/OAuth authentication"
-repository = "https://github.com/pegasusheavy/network-manager-openvpn-sso"
-homepage = "https://github.com/pegasusheavy/network-manager-openvpn-sso"
+repository = "https://github.com/quinnjr/network-manager-openvpn-sso"
+homepage = "https://github.com/quinnjr/network-manager-openvpn-sso"
 keywords = ["networkmanager", "openvpn", "sso", "oauth", "vpn"]
 categories = ["network-programming", "authentication"]
 
@@ -62,8 +62,8 @@ strip = true
 # Debian package configuration (cargo-deb)
 [package.metadata.deb]
 name = "networkmanager-openvpn-sso"
-maintainer = "Pegasus Heavy Industries LLC <pegasusheavyindustries@gmail.com>"
-copyright = "2026, Pegasus Heavy Industries LLC"
+maintainer = "Joseph R. Quinn <quinn.josephr@protonmail.com>"
+copyright = "2026, Joseph R. Quinn"
 license-file = ["LICENSE", "0"]
 extended-description = """\
 A NetworkManager VPN plugin that adds OAuth 2.0 / OIDC Single Sign-On \
