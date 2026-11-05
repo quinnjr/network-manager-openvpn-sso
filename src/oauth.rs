@@ -310,12 +310,16 @@ fn try_open_browser(url: &str) -> bool {
                 "--collect",
                 "--no-block",
                 "--quiet",
+                // xdg-open exits right after spawning the browser. With the default
+                // ExitType=main the unit then stops and kills its whole cgroup,
+                // including a freshly started browser.
+                "--property=ExitType=cgroup",
                 "xdg-open",
                 url,
             ]);
 
             info!(
-                "Running: systemd-run --user --machine={}@ xdg-open {}",
+                "Running: systemd-run --user --machine={}@ --property=ExitType=cgroup xdg-open {}",
                 user, url
             );
             match cmd.output() {
