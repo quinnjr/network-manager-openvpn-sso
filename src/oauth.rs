@@ -24,6 +24,19 @@ const AUTH_TIMEOUT_SECS: u64 = 60;
 /// Channel type for sending the OAuth result from the callback handler
 type OAuthResultSender = Arc<tokio::sync::Mutex<Option<oneshot::Sender<Result<(String, String)>>>>>;
 
+/// Aborts the wrapped task when dropped.
+///
+/// Used for the localhost callback servers: they must stop (and release their
+/// port) on every exit path - success, error, timeout, or the surrounding task
+/// being cancelled - otherwise every later login fails with "Failed to bind".
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Result of OAuth authentication
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -141,12 +154,12 @@ pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<(
         .route("/oauth/callback", get(handle_sso_callback))
         .with_state(Arc::new(callback_state));
 
-    let server_handle = tokio::spawn(async move {
+    let _server = AbortOnDrop(tokio::spawn(async move {
         axum::serve(listener, app)
             .await
             .map_err(|e| error!("OAuth callback server error: {}", e))
             .ok();
-    });
+    }));
 
     // Open browser
     let url_owned = auth_url.to_string();
@@ -204,9 +217,6 @@ pub async fn authenticate_sso(auth_url: &str, server_base_url: &str) -> Result<(
         error!("VPN server rejected OAuth: {} - {}", status, body);
         return Err(anyhow!("VPN server rejected authentication: {}", body));
     }
-
-    // Clean up
-    server_handle.abort();
 
     Ok(())
 }
@@ -765,12 +775,12 @@ pub async fn authenticate_with_callback(
         .with_state(callback_state.clone());
 
     // Spawn the server
-    let server_handle = tokio::spawn(async move {
+    let _server = AbortOnDrop(tokio::spawn(async move {
         axum::serve(listener, app)
             .await
             .map_err(|e| error!("Callback server error: {}", e))
             .ok();
-    });
+    }));
 
     // Show notification
     show_notification("VPN Authentication", "Opening browser for SSO login...");
@@ -790,9 +800,6 @@ pub async fn authenticate_with_callback(
         .await
         .map_err(|_| anyhow!("Authentication timed out after {}s", AUTH_TIMEOUT_SECS))?
         .map_err(|_| anyhow!("Authentication was cancelled"))??;
-
-    // Clean up server
-    server_handle.abort();
 
     info!("OAuth authentication completed successfully");
     show_notification("VPN Authentication", "Login successful!");
@@ -977,4 +984,28 @@ fn error_page(message: &str) -> String {
 </html>"#,
         message
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn abort_on_drop_releases_the_listening_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let guard = AbortOnDrop(tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        }));
+
+        drop(guard);
+        // Let the runtime cancel the task, which drops the listener.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        TcpListener::bind(addr)
+            .await
+            .expect("port should be free again after the guard was dropped");
+    }
 }
