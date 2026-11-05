@@ -193,6 +193,12 @@ impl ConnectionConfig {
             // management interface. Without this, OpenVPN refuses to start when
             // the profile has neither auth-user-pass nor a client certificate.
             "--auth-user-pass".to_string(),
+            // Announce web-based login support (sent to the server as peer info).
+            // Servers such as openvpn-auth-oauth2 reject clients without it
+            // instead of answering with a WEB_AUTH/OPEN_URL login URL.
+            "--setenv".to_string(),
+            "IV_SSO".to_string(),
+            "openurl,webauth".to_string(),
         ]);
 
         // Common: apply overrides
@@ -465,6 +471,9 @@ mod tests {
         assert!(args.iter().any(|a| a == "--management-hold"));
         assert!(args.iter().any(|a| a == "--script-security"));
         assert!(args.iter().any(|a| a == "--auth-user-pass"));
+        assert!(args
+            .windows(3)
+            .any(|w| w[0] == "--setenv" && w[1] == "IV_SSO" && w[2] == "openurl,webauth"));
     }
 
     #[test]
