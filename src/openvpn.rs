@@ -89,7 +89,13 @@ pub struct OpenVpnManager {
 
 impl OpenVpnManager {
     pub fn new(config: ConnectionConfig, event_tx: mpsc::Sender<VpnEvent>) -> Self {
-        let socket_path = PathBuf::from(format!("/tmp/nm-openvpn-sso-{}.sock", config.uuid));
+        // Same location as NetworkManager-openvpn's management socket: the openvpn
+        // AppArmor profile (e.g. on Ubuntu) allows @{run}/NetworkManager/nm-openvpn-*
+        // but denies creating the socket in /tmp.
+        let socket_path = PathBuf::from(format!(
+            "/run/NetworkManager/nm-openvpn-sso-{}.sock",
+            config.uuid
+        ));
 
         Self {
             config,
