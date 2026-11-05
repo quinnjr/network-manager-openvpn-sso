@@ -369,8 +369,12 @@ async fn process_vpn_events(
                     warn!("Failed to emit Ip4Config signal: {}", e);
                 }
 
-                // Finally emit StateChanged signal (state 5 = NM_VPN_CONNECTION_STATE_ACTIVATED)
-                if let Err(e) = emit_state_changed(&connection, 5).await {
+                // Finally report the plugin as started. StateChanged carries the
+                // service state (NMVpnServiceState), not the connection state:
+                // 5 would mean "stopping".
+                if let Err(e) =
+                    emit_state_changed(&connection, NMVpnServiceState::Started as u32).await
+                {
                     warn!("Failed to emit StateChanged signal: {}", e);
                 }
             }
