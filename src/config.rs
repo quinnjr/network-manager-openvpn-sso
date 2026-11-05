@@ -189,6 +189,10 @@ impl ConnectionConfig {
             "--management-hold".to_string(),
             "--script-security".to_string(),
             "2".to_string(),
+            // The SSO flow starts with placeholder credentials answered via the
+            // management interface. Without this, OpenVPN refuses to start when
+            // the profile has neither auth-user-pass nor a client certificate.
+            "--auth-user-pass".to_string(),
         ]);
 
         // Common: apply overrides
@@ -460,6 +464,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "--management-query-passwords"));
         assert!(args.iter().any(|a| a == "--management-hold"));
         assert!(args.iter().any(|a| a == "--script-security"));
+        assert!(args.iter().any(|a| a == "--auth-user-pass"));
     }
 
     #[test]
@@ -512,6 +517,7 @@ mod tests {
         assert_eq!(args[mgmt_idx + 2], "unix");
         assert!(args.iter().any(|a| a == "--management-query-passwords"));
         assert!(args.iter().any(|a| a == "--management-hold"));
+        assert!(args.iter().any(|a| a == "--auth-user-pass"));
 
         // "host:port" remote is split into --remote host port
         assert!(args
