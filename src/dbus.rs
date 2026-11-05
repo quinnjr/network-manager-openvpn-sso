@@ -6,7 +6,7 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use zbus::zvariant::OwnedValue;
 use zbus::{interface, Connection};
@@ -49,6 +49,10 @@ pub struct PluginState {
     pub vpn_manager: Option<OpenVpnManager>,
     pub current_config: Option<ConnectionConfig>,
     pub state: NMVpnServiceState,
+    /// Asks the task running `OpenVpnManager::connect` to disconnect. While that
+    /// task runs (i.e. for the whole lifetime of a connection) it owns the
+    /// manager, so `vpn_manager` above is `None`.
+    pub stop_tx: Option<oneshot::Sender<()>>,
 }
 
 impl Default for PluginState {
@@ -57,6 +61,7 @@ impl Default for PluginState {
             vpn_manager: None,
             current_config: None,
             state: NMVpnServiceState::Init,
+            stop_tx: None,
         }
     }
 }
@@ -95,6 +100,7 @@ impl VpnPlugin {
 
         // Create and store VPN manager
         let vpn_manager = OpenVpnManager::new(config.clone(), tx);
+        let (stop_tx, mut stop_rx) = oneshot::channel();
 
         // Update state
         {
@@ -102,6 +108,7 @@ impl VpnPlugin {
             state.current_config = Some(config.clone());
             state.state = NMVpnServiceState::Starting;
             state.vpn_manager = Some(vpn_manager);
+            state.stop_tx = Some(stop_tx);
         }
 
         // Start connection in background
@@ -115,14 +122,26 @@ impl VpnPlugin {
             };
 
             if let Some(ref mut mgr) = manager {
-                match mgr.connect().await {
-                    Ok(()) => {
+                let result = tokio::select! {
+                    result = mgr.connect() => Some(result),
+                    _ = &mut stop_rx => None,
+                };
+                match result {
+                    Some(Ok(())) => {
                         info!("OpenVPN management session ended");
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         error!("VPN connection failed: {}", e);
                         let mut state = state_clone.write().await;
                         state.state = NMVpnServiceState::Stopped;
+                    }
+                    None => {
+                        // Disconnect was requested while connecting/connected.
+                        // Dropping the connect future closed our management
+                        // connection, so disconnect() can open its own.
+                        if let Err(e) = mgr.disconnect().await {
+                            warn!("Error during disconnect: {}", e);
+                        }
                     }
                 }
             }
@@ -205,6 +224,11 @@ impl VpnPlugin {
 
         let mut state = self.inner_state.write().await;
         state.state = NMVpnServiceState::Stopping;
+
+        // A running connection task owns the manager; ask it to disconnect.
+        if let Some(stop_tx) = state.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
 
         if let Some(ref mut manager) = state.vpn_manager {
             if let Err(e) = manager.disconnect().await {
