@@ -376,7 +376,7 @@ impl OpenVpnManager {
             }
 
             let line = line.trim();
-            info!("MGMT: {}", line);
+            info!("MGMT: {}", redact_tokens(line));
 
             // Parse management interface messages
             if line.starts_with(">PASSWORD:") {
@@ -498,7 +498,7 @@ impl OpenVpnManager {
                             {
                                 Ok(Ok(n)) if n > 0 => {
                                     let next_line = next_line.trim();
-                                    info!("MGMT (waiting for SSO): {}", next_line);
+                                    info!("MGMT (waiting for SSO): {}", redact_tokens(next_line));
 
                                     // Check for INFO or INFOMSG with auth URL
                                     if next_line.starts_with(">INFO:")
@@ -508,7 +508,7 @@ impl OpenVpnManager {
                                             .strip_prefix(">INFO:")
                                             .or_else(|| next_line.strip_prefix(">INFOMSG:"))
                                             .unwrap_or(next_line);
-                                        info!("Server INFO/MSG: {}", info);
+                                        info!("Server INFO/MSG: {}", redact_tokens(info));
                                         if let Some(url) = extract_auth_url(info) {
                                             info!("Received auth URL from server: {}", url);
                                             self.pending_auth_url = Some(url);
@@ -714,7 +714,7 @@ impl OpenVpnManager {
                     .strip_prefix(">INFO:")
                     .or_else(|| line.strip_prefix(">INFOMSG:"))
                     .unwrap_or(line);
-                info!("Server INFO: {}", info);
+                info!("Server INFO: {}", redact_tokens(info));
 
                 // Check for auth-token (used for reconnection)
                 if let Some(token) = extract_auth_token(info) {
@@ -924,10 +924,8 @@ impl OpenVpnManager {
     /// Save credentials after successful connection for future reconnections
     async fn save_credentials_after_connect(&self) {
         info!(
-            "save_credentials_after_connect called, auth_token={:?}, pending_auth_url={:?}",
-            self.auth_token
-                .as_ref()
-                .map(|t| format!("{}...", &t[..t.len().min(20)])),
+            "save_credentials_after_connect called, has_auth_token={}, pending_auth_url={:?}",
+            self.auth_token.is_some(),
             self.pending_auth_url.is_some()
         );
         // Prefer auth_token if we received one from the server
@@ -1083,6 +1081,40 @@ fn extract_auth_url(message: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Hide session tokens in management lines before they are logged.
+///
+/// The server's auth-token (">PASSWORD:Auth-Token:SESS_ID_...", "auth-token,..."
+/// in pushed options, "AUTH_TOKEN:...") lets anyone reconnect without logging in,
+/// so it must not end up in the system journal.
+fn redact_tokens(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let mut result = String::with_capacity(line.len());
+    let mut pos = 0;
+    while let Some(found) = ["auth-token", "auth_token"]
+        .iter()
+        .filter_map(|marker| lower[pos..].find(marker).map(|i| pos + i + marker.len()))
+        .min()
+    {
+        // Keep the marker and its separator, drop the value up to the next
+        // separator.
+        let value_start = match line[found..].chars().next() {
+            Some(':') | Some(',') | Some(' ') => found + 1,
+            _ => found,
+        };
+        let value_end = line[value_start..]
+            .find([',', ' '])
+            .map(|i| value_start + i)
+            .unwrap_or(line.len());
+        result.push_str(&line[pos..value_start]);
+        if value_end > value_start {
+            result.push_str("[redacted]");
+        }
+        pos = value_end;
+    }
+    result.push_str(&line[pos..]);
+    result
 }
 
 /// Escape special characters for the management interface
@@ -1310,6 +1342,34 @@ mod tests {
     fn extract_auth_token_returns_none_when_no_token_present() {
         let msg = "just a regular log message with no token";
         assert_eq!(extract_auth_token(msg), None);
+    }
+
+    // -- redact_tokens ------------------------------------------------------
+
+    #[test]
+    fn redact_tokens_hides_auth_token_password_line() {
+        assert_eq!(
+            redact_tokens(">PASSWORD:Auth-Token:SESS_ID_AT_Axc0gorcKywz"),
+            ">PASSWORD:Auth-Token:[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_tokens_hides_pushed_auth_token_and_keeps_other_options() {
+        assert_eq!(
+            redact_tokens("PUSH_REPLY,route 10.0.0.0,auth-token SESS_ID_AT_abc,ping 10"),
+            "PUSH_REPLY,route 10.0.0.0,auth-token [redacted],ping 10"
+        );
+        assert_eq!(
+            redact_tokens("auth-token,SESS_ID_AT_abc,auth_token:xyz"),
+            "auth-token,[redacted],auth_token:[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_tokens_leaves_lines_without_tokens_unchanged() {
+        let line = ">STATE:1793908794,CONNECTED,SUCCESS,10.20.93.78,80.150.73.4,11194,,";
+        assert_eq!(redact_tokens(line), line);
     }
 
     // -- escape_management_string --------------------------------------------
