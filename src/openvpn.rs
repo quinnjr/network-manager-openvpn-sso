@@ -4,6 +4,8 @@
 //! OpenVPN process management and management interface protocol
 
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -49,27 +51,133 @@ pub enum VpnState {
     Failed = 11,
 }
 
-/// IP configuration received from OpenVPN
-#[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
+/// Tunnel configuration for NetworkManager, built from the environment OpenVPN
+/// reports on tunnel up (`--management-up-down`). It holds what
+/// NetworkManager-openvpn's helper script derives from the same variables.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VpnConfig {
+    /// Tunnel device (`dev`)
     pub tun_device: Option<String>,
-    pub local_ip: Option<String>,
-    pub remote_ip: Option<String>,
-    pub netmask: Option<String>,
-    pub gateway: Option<String>,
+    /// Public address of the VPN server (`trusted_ip`)
+    pub external_gateway: Option<Ipv4Addr>,
+    /// Our address inside the tunnel (`ifconfig_local`)
+    pub local_ip: Option<Ipv4Addr>,
+    /// Peer address for point-to-point topologies (`ifconfig_remote`)
+    pub ptp: Option<Ipv4Addr>,
+    /// Prefix length of `local_ip`
+    pub prefix: Option<u32>,
+    /// Gateway inside the tunnel (`route_vpn_gateway`)
+    pub internal_gateway: Option<Ipv4Addr>,
+    /// Tunnel MTU (`tun_mtu`)
     pub mtu: Option<u32>,
-    pub dns_servers: Vec<String>,
-    pub dns_search: Vec<String>,
+    /// Pushed `dhcp-option DNS` servers
+    pub dns_servers: Vec<Ipv4Addr>,
+    /// Pushed `dhcp-option DOMAIN` followed by `DOMAIN-SEARCH` entries
+    pub domains: Vec<String>,
+    /// Pushed routes (`route_network_N` etc.)
     pub routes: Vec<Route>,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
-    pub network: String,
-    pub netmask: String,
-    pub gateway: Option<String>,
+    pub network: Ipv4Addr,
+    pub prefix: u32,
+    pub gateway: Option<Ipv4Addr>,
+    pub metric: u32,
+}
+
+impl VpnConfig {
+    /// Build the configuration from OpenVPN's tunnel-up environment, following
+    /// nm-openvpn-service-openvpn-helper.
+    pub fn from_openvpn_env(env: &HashMap<String, String>) -> Self {
+        let ip = |name: &str| env.get(name).and_then(|v| v.parse::<Ipv4Addr>().ok());
+
+        let tun_device = env.get("dev").filter(|d| !d.is_empty()).cloned();
+        let is_tap = tun_device.as_deref().is_some_and(|d| d.starts_with("tap"));
+
+        let local_ip = ip("ifconfig_local");
+        let mut ptp = None;
+        let mut prefix = None;
+
+        // With "topology subnet" OpenVPN puts the netmask into ifconfig_remote.
+        if let Some(remote) = ip("ifconfig_remote") {
+            if remote.octets()[0] == 255 {
+                prefix = Some(netmask_to_prefix(remote));
+            } else {
+                ptp = Some(remote);
+            }
+        }
+        if let Some(netmask) = ip("ifconfig_netmask") {
+            prefix = Some(netmask_to_prefix(netmask));
+        } else if !is_tap && local_ip.is_some() && prefix.is_none() {
+            prefix = Some(32);
+        }
+
+        let mut routes = Vec::new();
+        for i in 1.. {
+            let Some(network) = env.get(&format!("route_network_{}", i)) else {
+                break;
+            };
+            let (Ok(network), Some(netmask)) = (
+                network.parse::<Ipv4Addr>(),
+                ip(&format!("route_netmask_{}", i)),
+            ) else {
+                warn!("Ignoring invalid pushed route #{}", i);
+                continue;
+            };
+            routes.push(Route {
+                network,
+                prefix: netmask_to_prefix(netmask),
+                gateway: ip(&format!("route_gateway_{}", i)),
+                metric: env
+                    .get(&format!("route_metric_{}", i))
+                    .and_then(|m| m.parse().ok())
+                    .unwrap_or(0),
+            });
+        }
+
+        let mut dns_servers = Vec::new();
+        let mut domains = Vec::new();
+        let mut search_domains = Vec::new();
+        for i in 1.. {
+            let Some(option) = env.get(&format!("foreign_option_{}", i)) else {
+                break;
+            };
+            let Some(option) = option.strip_prefix("dhcp-option ") else {
+                continue;
+            };
+            if let Some(servers) = option.strip_prefix("DNS ") {
+                dns_servers.extend(
+                    servers
+                        .split(' ')
+                        .filter_map(|s| s.parse::<Ipv4Addr>().ok()),
+                );
+            } else if let Some(domain) = option.strip_prefix("DOMAIN ") {
+                domains.push(domain.to_string());
+            } else if let Some(domain) = option.strip_prefix("DOMAIN-SEARCH ") {
+                search_domains.push(domain.to_string());
+            }
+        }
+        domains.extend(search_domains);
+        domains.retain(|d| (1..=255).contains(&d.len()));
+
+        Self {
+            tun_device,
+            external_gateway: ip("trusted_ip").or_else(|| ip("remote_1")),
+            local_ip,
+            ptp,
+            prefix,
+            internal_gateway: ip("route_vpn_gateway"),
+            mtu: env.get("tun_mtu").and_then(|m| m.parse().ok()),
+            dns_servers,
+            domains,
+            routes,
+        }
+    }
+}
+
+fn netmask_to_prefix(netmask: Ipv4Addr) -> u32 {
+    u32::from(netmask).leading_ones()
 }
 
 /// OpenVPN process manager
@@ -223,7 +331,8 @@ impl OpenVpnManager {
         let mut line = String::new();
 
         // State tracking
-        let mut vpn_config = VpnConfig::default();
+        // Environment of the last tunnel-up event (--management-up-down)
+        let mut tunnel_env: HashMap<String, String> = HashMap::new();
         let mut initial_auth_sent = false;
         let mut used_cached_token = false;
         let mut connected = false;
@@ -554,11 +663,16 @@ impl OpenVpnManager {
                             self.stop_browser_login();
                             connected = true;
 
-                            if parts.len() >= 4 {
-                                vpn_config.local_ip = Some(parts[3].to_string());
+                            let mut vpn_config = VpnConfig::from_openvpn_env(&tunnel_env);
+                            // Fall back to the addresses in the CONNECTED state
+                            // (">STATE:time,CONNECTED,SUCCESS,local,remote,...").
+                            if vpn_config.local_ip.is_none() {
+                                vpn_config.local_ip = parts.get(3).and_then(|ip| ip.parse().ok());
+                                vpn_config.prefix = vpn_config.local_ip.map(|_| 32);
                             }
-                            if parts.len() >= 5 {
-                                vpn_config.remote_ip = Some(parts[4].to_string());
+                            if vpn_config.external_gateway.is_none() {
+                                vpn_config.external_gateway =
+                                    parts.get(4).and_then(|ip| ip.parse().ok());
                             }
 
                             // Save credentials for future reconnections
@@ -581,6 +695,18 @@ impl OpenVpnManager {
                         }
                         _ => {}
                     }
+                }
+            } else if let Some(updown) = line.strip_prefix(">UPDOWN:") {
+                // Tunnel up/down notification (--management-up-down): "UP" or
+                // "DOWN", then the script environment as "ENV,name=value"
+                // lines terminated by "ENV,END".
+                if updown == "UP" {
+                    tunnel_env.clear();
+                } else if let Some((name, value)) = updown
+                    .strip_prefix("ENV,")
+                    .and_then(|var| var.split_once('='))
+                {
+                    tunnel_env.insert(name.to_string(), value.to_string());
                 }
             } else if line.starts_with(">INFO:") || line.starts_with(">INFOMSG:") {
                 // Info message (may contain web-auth URL or auth-token)
@@ -969,6 +1095,126 @@ fn escape_management_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- VpnConfig::from_openvpn_env ------------------------------------------
+
+    fn env(vars: &[(&str, &str)]) -> HashMap<String, String> {
+        vars.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn ip(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn from_openvpn_env_net30_topology_with_routes_and_dns() {
+        let config = VpnConfig::from_openvpn_env(&env(&[
+            ("dev", "tun0"),
+            ("trusted_ip", "80.150.73.4"),
+            ("ifconfig_local", "10.20.93.66"),
+            ("ifconfig_remote", "10.20.93.65"),
+            ("route_vpn_gateway", "10.20.93.65"),
+            ("tun_mtu", "1500"),
+            ("route_network_1", "10.20.10.0"),
+            ("route_netmask_1", "255.255.255.0"),
+            ("route_gateway_1", "10.20.93.65"),
+            ("route_network_2", "10.20.20.0"),
+            ("route_netmask_2", "255.255.255.0"),
+            ("route_gateway_2", "10.20.93.65"),
+            ("route_metric_2", "50"),
+            (
+                "foreign_option_1",
+                "dhcp-option DOMAIN-SEARCH intern.example.com",
+            ),
+            ("foreign_option_2", "dhcp-option DNS 10.20.20.1"),
+            ("foreign_option_3", "dhcp-option DOMAIN example.com"),
+            ("foreign_option_4", "block-outside-dns"),
+        ]));
+
+        assert_eq!(config.tun_device.as_deref(), Some("tun0"));
+        assert_eq!(config.external_gateway, Some(ip("80.150.73.4")));
+        assert_eq!(config.local_ip, Some(ip("10.20.93.66")));
+        assert_eq!(config.ptp, Some(ip("10.20.93.65")));
+        assert_eq!(config.prefix, Some(32));
+        assert_eq!(config.internal_gateway, Some(ip("10.20.93.65")));
+        assert_eq!(config.mtu, Some(1500));
+        assert_eq!(
+            config.routes,
+            vec![
+                Route {
+                    network: ip("10.20.10.0"),
+                    prefix: 24,
+                    gateway: Some(ip("10.20.93.65")),
+                    metric: 0,
+                },
+                Route {
+                    network: ip("10.20.20.0"),
+                    prefix: 24,
+                    gateway: Some(ip("10.20.93.65")),
+                    metric: 50,
+                },
+            ]
+        );
+        assert_eq!(config.dns_servers, vec![ip("10.20.20.1")]);
+        // DOMAIN entries come first, then DOMAIN-SEARCH
+        assert_eq!(config.domains, vec!["example.com", "intern.example.com"]);
+    }
+
+    #[test]
+    fn from_openvpn_env_subnet_topology_takes_prefix_from_netmask_in_ifconfig_remote() {
+        let config = VpnConfig::from_openvpn_env(&env(&[
+            ("dev", "tun1"),
+            ("ifconfig_local", "10.8.0.6"),
+            ("ifconfig_remote", "255.255.255.0"),
+        ]));
+
+        assert_eq!(config.local_ip, Some(ip("10.8.0.6")));
+        assert_eq!(config.ptp, None);
+        assert_eq!(config.prefix, Some(24));
+    }
+
+    #[test]
+    fn from_openvpn_env_prefers_ifconfig_netmask() {
+        let config = VpnConfig::from_openvpn_env(&env(&[
+            ("dev", "tap0"),
+            ("ifconfig_local", "192.168.5.10"),
+            ("ifconfig_netmask", "255.255.252.0"),
+        ]));
+
+        assert_eq!(config.prefix, Some(22));
+    }
+
+    #[test]
+    fn from_openvpn_env_skips_invalid_routes_and_stops_at_first_gap() {
+        let config = VpnConfig::from_openvpn_env(&env(&[
+            ("route_network_1", "not-an-ip"),
+            ("route_netmask_1", "255.255.255.0"),
+            ("route_network_2", "10.1.0.0"),
+            ("route_netmask_2", "255.255.0.0"),
+            ("route_network_4", "10.2.0.0"),
+            ("route_netmask_4", "255.255.0.0"),
+        ]));
+
+        assert_eq!(
+            config.routes,
+            vec![Route {
+                network: ip("10.1.0.0"),
+                prefix: 16,
+                gateway: None,
+                metric: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn from_openvpn_env_without_variables_is_empty() {
+        assert_eq!(
+            VpnConfig::from_openvpn_env(&HashMap::new()),
+            VpnConfig::default()
+        );
+    }
 
     // -- extract_auth_url -------------------------------------------------
 

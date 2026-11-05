@@ -5,14 +5,15 @@
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
-use zbus::zvariant::OwnedValue;
+use zbus::zvariant::{OwnedValue, Value};
 use zbus::{interface, Connection};
 
 use crate::config::ConnectionConfig;
-use crate::openvpn::{OpenVpnManager, VpnEvent, VpnState};
+use crate::openvpn::{OpenVpnManager, VpnConfig, VpnEvent, VpnState};
 
 /// D-Bus service name
 const SERVICE_NAME: &str = "org.freedesktop.NetworkManager.openvpn-sso";
@@ -419,34 +420,79 @@ async fn emit_state_changed(connection: &Connection, state: u32) -> Result<()> {
         .map_err(|e| anyhow!("Failed to emit signal: {}", e))
 }
 
-/// Emit Config signal with tunnel device info
-async fn emit_config(
-    connection: &Connection,
-    vpn_config: &crate::openvpn::VpnConfig,
-) -> Result<()> {
-    use zbus::zvariant::Value;
+/// NetworkManager expects IPv4 addresses as u32 holding the address in network
+/// byte order (an `in_addr_t`), not the numeric value of the address.
+fn nm_ip4(addr: Ipv4Addr) -> u32 {
+    u32::from_ne_bytes(addr.octets())
+}
 
-    let mut config: HashMap<String, Value> = HashMap::new();
+/// Build the generic VPN configuration (the Config signal)
+fn build_config(vpn_config: &VpnConfig) -> HashMap<&'static str, Value<'static>> {
+    let mut config = HashMap::new();
 
-    // Add tunnel device - try to find the actual tun device
     let tundev = vpn_config
         .tun_device
         .clone()
         .unwrap_or_else(|| "tun0".to_string());
-    config.insert("tundev".to_string(), Value::new(tundev.clone()));
+    config.insert("tundev", Value::new(tundev));
 
-    // Add gateway (VPN server external IP) as u32 - this is the remote server
-    // NetworkManager expects this as a u32 in network byte order
-    if let Some(ref gateway) = vpn_config.remote_ip {
-        if let Ok(addr) = gateway.parse::<std::net::Ipv4Addr>() {
-            let gw_u32: u32 = addr.into();
-            config.insert("gateway".to_string(), Value::new(gw_u32));
-        }
+    // Public address of the VPN server; NetworkManager keeps it routed outside
+    // the tunnel.
+    if let Some(gateway) = vpn_config.external_gateway {
+        config.insert("gateway", Value::new(nm_ip4(gateway)));
+    }
+    if let Some(mtu) = vpn_config.mtu {
+        config.insert("mtu", Value::new(mtu));
+    }
+    config.insert("has-ip4", Value::new(vpn_config.local_ip.is_some()));
+
+    config
+}
+
+/// Build the IPv4 configuration (the Ip4Config signal); None without an address
+fn build_ip4_config(vpn_config: &VpnConfig) -> Option<HashMap<&'static str, Value<'static>>> {
+    let local_ip = vpn_config.local_ip?;
+    let mut config = HashMap::new();
+
+    config.insert("address", Value::new(nm_ip4(local_ip)));
+    if let Some(prefix) = vpn_config.prefix {
+        config.insert("prefix", Value::new(prefix));
+    }
+    if let Some(ptp) = vpn_config.ptp {
+        config.insert("ptp", Value::new(nm_ip4(ptp)));
+    }
+    if let Some(gateway) = vpn_config.internal_gateway {
+        config.insert("internal-gateway", Value::new(nm_ip4(gateway)));
+    }
+    if !vpn_config.routes.is_empty() {
+        let routes: Vec<Vec<u32>> = vpn_config
+            .routes
+            .iter()
+            .map(|r| {
+                vec![
+                    nm_ip4(r.network),
+                    r.prefix,
+                    r.gateway.map(nm_ip4).unwrap_or(0),
+                    r.metric,
+                ]
+            })
+            .collect();
+        config.insert("routes", Value::new(routes));
+    }
+    if !vpn_config.dns_servers.is_empty() {
+        let dns: Vec<u32> = vpn_config.dns_servers.iter().copied().map(nm_ip4).collect();
+        config.insert("dns", Value::new(dns));
+    }
+    if !vpn_config.domains.is_empty() {
+        config.insert("domains", Value::new(vpn_config.domains.clone()));
     }
 
-    // Mark that we have IPv4 config
-    config.insert("has-ip4".to_string(), Value::new(true));
+    Some(config)
+}
 
+/// Emit Config signal with tunnel device info
+async fn emit_config(connection: &Connection, vpn_config: &VpnConfig) -> Result<()> {
+    let config = build_config(vpn_config);
     info!("Emitting Config signal: {:?}", config);
     connection
         .emit_signal(
@@ -461,63 +507,10 @@ async fn emit_config(
 }
 
 /// Emit Ip4Config signal
-async fn emit_ip4_config(
-    connection: &Connection,
-    vpn_config: &crate::openvpn::VpnConfig,
-) -> Result<()> {
-    use zbus::zvariant::Value;
-
-    let mut config: HashMap<String, Value> = HashMap::new();
-
-    // Add internal IP address (VPN address assigned to us)
-    if let Some(ref ip) = vpn_config.local_ip {
-        if let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() {
-            // NetworkManager expects IPs as u32 (host byte order, which Ipv4Addr::into provides)
-            let ip_u32: u32 = addr.into();
-            config.insert("address".to_string(), Value::new(ip_u32));
-
-            // Add prefix length (default /24 for VPN subnet)
-            let prefix: u32 = 24;
-            config.insert("prefix".to_string(), Value::new(prefix));
-
-            // For internal VPN gateway, use .1 of the subnet (typical OpenVPN server address)
-            let octets = addr.octets();
-            let internal_gw = std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], 1);
-            let internal_gw_u32: u32 = internal_gw.into();
-            config.insert("int-gw".to_string(), Value::new(internal_gw_u32));
-        }
-    }
-
-    // Add VPN server's public/external gateway address for routing
-    // This tells NM where VPN traffic should be routed through
-    if let Some(ref gateway) = vpn_config.remote_ip {
-        if let Ok(gw_addr) = gateway.parse::<std::net::Ipv4Addr>() {
-            let gw_u32: u32 = gw_addr.into();
-            config.insert("gateway".to_string(), Value::new(gw_u32));
-        }
-    }
-
-    // Add DNS servers
-    if !vpn_config.dns_servers.is_empty() {
-        let dns: Vec<u32> = vpn_config
-            .dns_servers
-            .iter()
-            .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
-            .map(|a| a.into())
-            .collect();
-        if !dns.is_empty() {
-            config.insert("dns".to_string(), Value::new(dns));
-        }
-    }
-
-    // Add DNS search domains
-    if !vpn_config.dns_search.is_empty() {
-        config.insert(
-            "dns-search".to_string(),
-            Value::new(vpn_config.dns_search.clone()),
-        );
-    }
-
+async fn emit_ip4_config(connection: &Connection, vpn_config: &VpnConfig) -> Result<()> {
+    let Some(config) = build_ip4_config(vpn_config) else {
+        return Err(anyhow!("OpenVPN reported no IPv4 address for the tunnel"));
+    };
     info!("Emitting Ip4Config signal: {:?}", config);
     connection
         .emit_signal(
@@ -578,5 +571,90 @@ pub async fn run_service() -> Result<()> {
     // Keep the service running
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::openvpn::Route;
+
+    fn ip(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    fn sample_config() -> VpnConfig {
+        VpnConfig {
+            tun_device: Some("tun0".to_string()),
+            external_gateway: Some(ip("80.150.73.4")),
+            local_ip: Some(ip("10.20.93.66")),
+            ptp: Some(ip("10.20.93.65")),
+            prefix: Some(32),
+            internal_gateway: Some(ip("10.20.93.65")),
+            mtu: Some(1500),
+            dns_servers: vec![ip("10.20.20.1")],
+            domains: vec!["example.com".to_string()],
+            routes: vec![Route {
+                network: ip("10.20.10.0"),
+                prefix: 24,
+                gateway: Some(ip("10.20.93.65")),
+                metric: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn nm_ip4_uses_network_byte_order() {
+        // The first octet must be the first byte in memory, like in_addr_t.
+        assert_eq!(nm_ip4(ip("10.20.93.66")).to_ne_bytes(), [10, 20, 93, 66]);
+        #[cfg(target_endian = "little")]
+        assert_eq!(nm_ip4(ip("10.20.93.66")), 0x425D_140A);
+    }
+
+    #[test]
+    fn build_config_uses_networkmanager_keys() {
+        let config = build_config(&sample_config());
+
+        assert_eq!(config["tundev"], Value::new("tun0"));
+        assert_eq!(config["gateway"], Value::new(nm_ip4(ip("80.150.73.4"))));
+        assert_eq!(config["mtu"], Value::new(1500u32));
+        assert_eq!(config["has-ip4"], Value::new(true));
+    }
+
+    #[test]
+    fn build_ip4_config_uses_networkmanager_keys() {
+        let config = build_ip4_config(&sample_config()).unwrap();
+
+        assert_eq!(config["address"], Value::new(nm_ip4(ip("10.20.93.66"))));
+        assert_eq!(config["prefix"], Value::new(32u32));
+        assert_eq!(config["ptp"], Value::new(nm_ip4(ip("10.20.93.65"))));
+        assert_eq!(
+            config["internal-gateway"],
+            Value::new(nm_ip4(ip("10.20.93.65")))
+        );
+        assert_eq!(
+            config["routes"],
+            Value::new(vec![vec![
+                nm_ip4(ip("10.20.10.0")),
+                24u32,
+                nm_ip4(ip("10.20.93.65")),
+                0u32
+            ]])
+        );
+        assert_eq!(config["dns"], Value::new(vec![nm_ip4(ip("10.20.20.1"))]));
+        assert_eq!(
+            config["domains"],
+            Value::new(vec!["example.com".to_string()])
+        );
+        assert_eq!(config["routes"].value_signature(), "aau");
+    }
+
+    #[test]
+    fn build_ip4_config_without_address_is_none() {
+        let mut vpn_config = sample_config();
+        vpn_config.local_ip = None;
+
+        assert!(build_ip4_config(&vpn_config).is_none());
+        assert_eq!(build_config(&vpn_config)["has-ip4"], Value::new(false));
     }
 }

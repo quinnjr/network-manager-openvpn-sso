@@ -199,6 +199,12 @@ impl ConnectionConfig {
             "--setenv".to_string(),
             "IV_SSO".to_string(),
             "openurl,webauth".to_string(),
+            // Like NetworkManager-openvpn: OpenVPN only creates the tunnel
+            // device, and NetworkManager configures addresses, routes and DNS
+            // from the tunnel environment reported via the management interface.
+            "--management-up-down".to_string(),
+            "--ifconfig-noexec".to_string(),
+            "--route-noexec".to_string(),
         ]);
 
         // Common: apply overrides
@@ -474,6 +480,9 @@ mod tests {
         assert!(args
             .windows(3)
             .any(|w| w[0] == "--setenv" && w[1] == "IV_SSO" && w[2] == "openurl,webauth"));
+        assert!(args.iter().any(|a| a == "--management-up-down"));
+        assert!(args.iter().any(|a| a == "--ifconfig-noexec"));
+        assert!(args.iter().any(|a| a == "--route-noexec"));
     }
 
     #[test]
