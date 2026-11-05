@@ -82,6 +82,8 @@ pub struct OpenVpnManager {
     pending_auth_url: Option<String>,
     /// Flag to track if SSO browser auth has been initiated (to prevent duplicates)
     sso_auth_initiated: bool,
+    /// Background task running the browser login (see `start_browser_login`)
+    sso_task: Option<tokio::task::JoinHandle<()>>,
     /// Auth token received from server after successful authentication
     /// This can be used for reconnection without browser auth
     auth_token: Option<String>,
@@ -104,6 +106,7 @@ impl OpenVpnManager {
             event_tx,
             pending_auth_url: None,
             sso_auth_initiated: false,
+            sso_task: None,
             auth_token: None,
         }
     }
@@ -273,7 +276,7 @@ impl OpenVpnManager {
                             .await
                             .ok();
 
-                        if let Err(e) = self.handle_sso_auth(&mut writer, &url).await {
+                        if let Err(e) = self.start_browser_login(&url) {
                             error!("SSO authentication failed: {}", e);
                             self.event_tx
                                 .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
@@ -427,7 +430,7 @@ impl OpenVpnManager {
                                 .await
                                 .ok();
 
-                            if let Err(e) = self.handle_sso_auth(&mut writer, &url).await {
+                            if let Err(e) = self.start_browser_login(&url) {
                                 error!("SSO authentication failed: {}", e);
                                 self.event_tx
                                     .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
@@ -509,41 +512,8 @@ impl OpenVpnManager {
                                     .ok();
 
                                 // Start localhost callback server + open browser for SSO
-                                if !self.sso_auth_initiated {
-                                    self.sso_auth_initiated = true;
-
-                                    // Extract server base URL from auth URL for POSTing back
-                                    let server_base = match url::Url::parse(&url) {
-                                        Ok(u) => format!(
-                                            "{}://{}:{}",
-                                            u.scheme(),
-                                            u.host_str().unwrap_or(""),
-                                            u.port().unwrap_or(9000)
-                                        ),
-                                        Err(e) => {
-                                            error!("Failed to parse auth URL: {}", e);
-                                            url.clone()
-                                        }
-                                    };
-
-                                    // Spawn the SSO flow (localhost server + browser + POST)
-                                    // in a background task so the management loop continues
-                                    let url_clone = url.clone();
-                                    tokio::spawn(async move {
-                                        match crate::oauth::authenticate_sso(
-                                            &url_clone,
-                                            &server_base,
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {
-                                                info!("SSO authentication completed successfully")
-                                            }
-                                            Err(e) => error!("SSO authentication failed: {}", e),
-                                        }
-                                    });
-                                } else {
-                                    info!("SSO auth already initiated, skipping duplicate");
+                                if let Err(e) = self.start_browser_login(&url) {
+                                    error!("Failed to start SSO login: {}", e);
                                 }
                             } else {
                                 warn!(
@@ -564,6 +534,10 @@ impl OpenVpnManager {
                                 .ok();
                         }
                         "CONNECTED" => {
+                            // Servers that complete the web login themselves (e.g.
+                            // openvpn-auth-oauth2) never call back to localhost.
+                            self.stop_browser_login();
+
                             if parts.len() >= 4 {
                                 vpn_config.local_ip = Some(parts[3].to_string());
                             }
@@ -685,10 +659,10 @@ impl OpenVpnManager {
         };
 
         // Perform SSO auth with the URL
-        self.handle_sso_auth(writer, url).await
+        self.start_browser_login(url)
     }
 
-    /// Handle SSO/browser-based authentication
+    /// Start the browser-based SSO login in a background task.
     ///
     /// The flow:
     /// 1. Start a localhost HTTP server on port 19823 to receive the OAuth callback
@@ -697,11 +671,13 @@ impl OpenVpnManager {
     /// 4. We receive the auth code and POST it to the VPN server's /auth/complete
     /// 5. The VPN server exchanges the code for a token, verifies the user, and
     ///    completes the VPN authentication by sending PUSH_REPLY
-    async fn handle_sso_auth(
-        &mut self,
-        _writer: &mut tokio::net::unix::OwnedWriteHalf,
-        auth_url: &str,
-    ) -> Result<()> {
+    ///
+    /// Servers implementing standard OpenVPN web auth (WEB_AUTH/OPEN_URL, e.g.
+    /// openvpn-auth-oauth2) complete the login themselves and never call back to
+    /// localhost. Either way the outcome is reported through the management
+    /// interface, so this must not block the management loop: it returns right
+    /// away, and the task is stopped once OpenVPN reports CONNECTED.
+    fn start_browser_login(&mut self, auth_url: &str) -> Result<()> {
         // Prevent duplicate browser launches
         if self.sso_auth_initiated {
             info!("SSO auth already initiated, skipping duplicate browser open");
@@ -709,7 +685,6 @@ impl OpenVpnManager {
         }
 
         info!("Starting SSO authentication with URL: {}", auth_url);
-        self.sso_auth_initiated = true;
 
         // Extract the VPN server host from the auth URL for later POSTing
         // auth_url looks like: http://34.214.23.25:9000/auth/start?state=...
@@ -720,24 +695,24 @@ impl OpenVpnManager {
                 u.host_str().unwrap_or(""),
                 u.port().unwrap_or(9000)
             ),
-            Err(_) => {
-                self.sso_auth_initiated = false;
-                return Err(anyhow!("Invalid auth URL: {}", auth_url));
-            }
+            Err(_) => return Err(anyhow!("Invalid auth URL: {}", auth_url)),
         };
 
-        // Start the localhost callback server and open the browser concurrently
-        use crate::oauth;
-        match oauth::authenticate_sso(auth_url, &server_base_url).await {
-            Ok(()) => {
-                info!("SSO authentication flow completed");
-                Ok(())
+        self.sso_auth_initiated = true;
+        let auth_url = auth_url.to_string();
+        self.sso_task = Some(tokio::spawn(async move {
+            match crate::oauth::authenticate_sso(&auth_url, &server_base_url).await {
+                Ok(()) => info!("SSO authentication flow completed"),
+                Err(e) => error!("SSO authentication failed: {}", e),
             }
-            Err(e) => {
-                error!("SSO authentication failed: {}", e);
-                self.sso_auth_initiated = false;
-                Err(anyhow!("SSO authentication failed: {}", e))
-            }
+        }));
+        Ok(())
+    }
+
+    /// Stop a running browser login task (and its localhost callback server).
+    fn stop_browser_login(&mut self) {
+        if let Some(task) = self.sso_task.take() {
+            task.abort();
         }
     }
 
@@ -763,6 +738,8 @@ impl OpenVpnManager {
 
     /// Disconnect the VPN
     pub async fn disconnect(&mut self) -> Result<()> {
+        self.stop_browser_login();
+
         if let Some(ref mut child) = self.process {
             info!("Stopping OpenVPN process");
 
@@ -1103,6 +1080,8 @@ mod tests {
 
 impl Drop for OpenVpnManager {
     fn drop(&mut self) {
+        self.stop_browser_login();
+
         if let Some(ref mut child) = self.process {
             // Best effort cleanup
             let _ = child.start_kill();
