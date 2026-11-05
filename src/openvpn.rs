@@ -111,8 +111,23 @@ impl OpenVpnManager {
         }
     }
 
-    /// Start OpenVPN and manage the connection
+    /// Start OpenVPN and manage the connection.
+    ///
+    /// Returns when the management session ends. Any error is also reported as
+    /// `VpnEvent::Failed`, so NetworkManager learns about it right away instead
+    /// of waiting for its activation timeout.
     pub async fn connect(&mut self) -> Result<()> {
+        let result = self.start_and_manage().await;
+        if let Err(ref e) = result {
+            self.event_tx
+                .send(VpnEvent::Failed(e.to_string()))
+                .await
+                .ok();
+        }
+        result
+    }
+
+    async fn start_and_manage(&mut self) -> Result<()> {
         // Kill any stale openvpn processes using the same management socket
         self.kill_stale_openvpn_processes().await;
 
@@ -211,6 +226,7 @@ impl OpenVpnManager {
         let mut vpn_config = VpnConfig::default();
         let mut initial_auth_sent = false;
         let mut used_cached_token = false;
+        let mut connected = false;
 
         // Check for cached credentials before starting
         let cached_token = secrets::get_cached_credentials(&self.config.uuid).await;
@@ -236,6 +252,17 @@ impl OpenVpnManager {
 
             if n == 0 {
                 warn!("Management connection closed");
+                if !connected {
+                    // OpenVPN exited during startup or authentication
+                    // (e.g. AUTH_FAILED); there is no connection to report.
+                    return Err(anyhow!(
+                        "OpenVPN exited before the connection was established"
+                    ));
+                }
+                self.event_tx
+                    .send(VpnEvent::State(VpnState::Stopped))
+                    .await
+                    .ok();
                 break;
             }
 
@@ -278,11 +305,7 @@ impl OpenVpnManager {
 
                         if let Err(e) = self.start_browser_login(&url) {
                             error!("SSO authentication failed: {}", e);
-                            self.event_tx
-                                .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
-                                .await
-                                .ok();
-                            return Err(e);
+                            return Err(anyhow!("Auth failed: {}", e));
                         }
                     } else {
                         error!("Verification failed but no auth URL found in response");
@@ -432,11 +455,7 @@ impl OpenVpnManager {
 
                             if let Err(e) = self.start_browser_login(&url) {
                                 error!("SSO authentication failed: {}", e);
-                                self.event_tx
-                                    .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
-                                    .await
-                                    .ok();
-                                return Err(e);
+                                return Err(anyhow!("Auth failed: {}", e));
                             }
                         } else if wait_start.elapsed() >= max_wait {
                             warn!(
@@ -463,11 +482,7 @@ impl OpenVpnManager {
                     // Attempt authentication
                     if let Err(e) = self.handle_auth(&mut writer, auth_url.as_deref()).await {
                         error!("Authentication failed: {}", e);
-                        self.event_tx
-                            .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
-                            .await
-                            .ok();
-                        return Err(e);
+                        return Err(anyhow!("Auth failed: {}", e));
                     }
                 }
             } else if line.starts_with(">STATE:") {
@@ -537,6 +552,7 @@ impl OpenVpnManager {
                             // Servers that complete the web login themselves (e.g.
                             // openvpn-auth-oauth2) never call back to localhost.
                             self.stop_browser_login();
+                            connected = true;
 
                             if parts.len() >= 4 {
                                 vpn_config.local_ip = Some(parts[3].to_string());
@@ -610,10 +626,6 @@ impl OpenVpnManager {
             } else if line.starts_with(">FATAL:") {
                 let msg = line.strip_prefix(">FATAL:").unwrap_or(line);
                 error!("OpenVPN fatal error: {}", msg);
-                self.event_tx
-                    .send(VpnEvent::Failed(msg.to_string()))
-                    .await
-                    .ok();
                 return Err(anyhow!("OpenVPN fatal: {}", msg));
             } else if line.starts_with(">LOG:") {
                 let log = line.strip_prefix(">LOG:").unwrap_or(line);

@@ -117,7 +117,7 @@ impl VpnPlugin {
             if let Some(ref mut mgr) = manager {
                 match mgr.connect().await {
                     Ok(()) => {
-                        info!("VPN connection established");
+                        info!("OpenVPN management session ended");
                     }
                     Err(e) => {
                         error!("VPN connection failed: {}", e);
@@ -358,6 +358,15 @@ async fn process_vpn_events(
                 // Emit Failure signal (1 = connect failed)
                 if let Err(e) = emit_failure(&connection, 1).await {
                     warn!("Failed to emit Failure signal: {}", e);
+                }
+
+                // NetworkManager only gives up on the activation once the
+                // plugin reports that it stopped; Failure alone leaves it
+                // waiting for its timeout.
+                if let Err(e) =
+                    emit_state_changed(&connection, NMVpnServiceState::Stopped as u32).await
+                {
+                    warn!("Failed to emit StateChanged signal: {}", e);
                 }
             }
             VpnEvent::Log(msg) => {
