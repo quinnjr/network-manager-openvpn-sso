@@ -1141,10 +1141,15 @@ fn redact_tokens(line: &str) -> String {
         .min()
     {
         // Keep the marker and its separator, drop the value up to the next
-        // separator.
+        // separator. Without a separator the marker is just a word, as in
+        // "RECONNECTING,auth-failure (auth-token)".
         let value_start = match line[found..].chars().next() {
             Some(':') | Some(',') | Some(' ') => found + 1,
-            _ => found,
+            _ => {
+                result.push_str(&line[pos..found]);
+                pos = found;
+                continue;
+            }
         };
         let value_end = line[value_start..]
             .find([',', ' '])
@@ -1422,6 +1427,12 @@ mod tests {
     #[test]
     fn redact_tokens_leaves_lines_without_tokens_unchanged() {
         let line = ">STATE:1793908794,CONNECTED,SUCCESS,10.20.93.78,80.150.73.4,11194,,";
+        assert_eq!(redact_tokens(line), line);
+    }
+
+    #[test]
+    fn redact_tokens_leaves_marker_without_value_unchanged() {
+        let line = ">STATE:1794002794,RECONNECTING,auth-failure (auth-token),,,,,";
         assert_eq!(redact_tokens(line), line);
     }
 
