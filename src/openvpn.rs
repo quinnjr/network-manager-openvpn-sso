@@ -4,6 +4,8 @@
 //! OpenVPN process management and management interface protocol
 
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -49,27 +51,133 @@ pub enum VpnState {
     Failed = 11,
 }
 
-/// IP configuration received from OpenVPN
-#[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
+/// Tunnel configuration for NetworkManager, built from the environment OpenVPN
+/// reports on tunnel up (`--management-up-down`). It holds what
+/// NetworkManager-openvpn's helper script derives from the same variables.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VpnConfig {
+    /// Tunnel device (`dev`)
     pub tun_device: Option<String>,
-    pub local_ip: Option<String>,
-    pub remote_ip: Option<String>,
-    pub netmask: Option<String>,
-    pub gateway: Option<String>,
+    /// Public address of the VPN server (`trusted_ip`)
+    pub external_gateway: Option<Ipv4Addr>,
+    /// Our address inside the tunnel (`ifconfig_local`)
+    pub local_ip: Option<Ipv4Addr>,
+    /// Peer address for point-to-point topologies (`ifconfig_remote`)
+    pub ptp: Option<Ipv4Addr>,
+    /// Prefix length of `local_ip`
+    pub prefix: Option<u32>,
+    /// Gateway inside the tunnel (`route_vpn_gateway`)
+    pub internal_gateway: Option<Ipv4Addr>,
+    /// Tunnel MTU (`tun_mtu`)
     pub mtu: Option<u32>,
-    pub dns_servers: Vec<String>,
-    pub dns_search: Vec<String>,
+    /// Pushed `dhcp-option DNS` servers
+    pub dns_servers: Vec<Ipv4Addr>,
+    /// Pushed `dhcp-option DOMAIN` followed by `DOMAIN-SEARCH` entries
+    pub domains: Vec<String>,
+    /// Pushed routes (`route_network_N` etc.)
     pub routes: Vec<Route>,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
-    pub network: String,
-    pub netmask: String,
-    pub gateway: Option<String>,
+    pub network: Ipv4Addr,
+    pub prefix: u32,
+    pub gateway: Option<Ipv4Addr>,
+    pub metric: u32,
+}
+
+impl VpnConfig {
+    /// Build the configuration from OpenVPN's tunnel-up environment, following
+    /// nm-openvpn-service-openvpn-helper.
+    pub fn from_openvpn_env(env: &HashMap<String, String>) -> Self {
+        let ip = |name: &str| env.get(name).and_then(|v| v.parse::<Ipv4Addr>().ok());
+
+        let tun_device = env.get("dev").filter(|d| !d.is_empty()).cloned();
+        let is_tap = tun_device.as_deref().is_some_and(|d| d.starts_with("tap"));
+
+        let local_ip = ip("ifconfig_local");
+        let mut ptp = None;
+        let mut prefix = None;
+
+        // With "topology subnet" OpenVPN puts the netmask into ifconfig_remote.
+        if let Some(remote) = ip("ifconfig_remote") {
+            if remote.octets()[0] == 255 {
+                prefix = Some(netmask_to_prefix(remote));
+            } else {
+                ptp = Some(remote);
+            }
+        }
+        if let Some(netmask) = ip("ifconfig_netmask") {
+            prefix = Some(netmask_to_prefix(netmask));
+        } else if !is_tap && local_ip.is_some() && prefix.is_none() {
+            prefix = Some(32);
+        }
+
+        let mut routes = Vec::new();
+        for i in 1.. {
+            let Some(network) = env.get(&format!("route_network_{}", i)) else {
+                break;
+            };
+            let (Ok(network), Some(netmask)) = (
+                network.parse::<Ipv4Addr>(),
+                ip(&format!("route_netmask_{}", i)),
+            ) else {
+                warn!("Ignoring invalid pushed route #{}", i);
+                continue;
+            };
+            routes.push(Route {
+                network,
+                prefix: netmask_to_prefix(netmask),
+                gateway: ip(&format!("route_gateway_{}", i)),
+                metric: env
+                    .get(&format!("route_metric_{}", i))
+                    .and_then(|m| m.parse().ok())
+                    .unwrap_or(0),
+            });
+        }
+
+        let mut dns_servers = Vec::new();
+        let mut domains = Vec::new();
+        let mut search_domains = Vec::new();
+        for i in 1.. {
+            let Some(option) = env.get(&format!("foreign_option_{}", i)) else {
+                break;
+            };
+            let Some(option) = option.strip_prefix("dhcp-option ") else {
+                continue;
+            };
+            if let Some(servers) = option.strip_prefix("DNS ") {
+                dns_servers.extend(
+                    servers
+                        .split(' ')
+                        .filter_map(|s| s.parse::<Ipv4Addr>().ok()),
+                );
+            } else if let Some(domain) = option.strip_prefix("DOMAIN ") {
+                domains.push(domain.to_string());
+            } else if let Some(domain) = option.strip_prefix("DOMAIN-SEARCH ") {
+                search_domains.push(domain.to_string());
+            }
+        }
+        domains.extend(search_domains);
+        domains.retain(|d| (1..=255).contains(&d.len()));
+
+        Self {
+            tun_device,
+            external_gateway: ip("trusted_ip").or_else(|| ip("remote_1")),
+            local_ip,
+            ptp,
+            prefix,
+            internal_gateway: ip("route_vpn_gateway"),
+            mtu: env.get("tun_mtu").and_then(|m| m.parse().ok()),
+            dns_servers,
+            domains,
+            routes,
+        }
+    }
+}
+
+fn netmask_to_prefix(netmask: Ipv4Addr) -> u32 {
+    u32::from(netmask).leading_ones()
 }
 
 /// OpenVPN process manager
@@ -82,6 +190,8 @@ pub struct OpenVpnManager {
     pending_auth_url: Option<String>,
     /// Flag to track if SSO browser auth has been initiated (to prevent duplicates)
     sso_auth_initiated: bool,
+    /// Background task running the browser login (see `start_browser_login`)
+    sso_task: Option<tokio::task::JoinHandle<()>>,
     /// Auth token received from server after successful authentication
     /// This can be used for reconnection without browser auth
     auth_token: Option<String>,
@@ -89,7 +199,13 @@ pub struct OpenVpnManager {
 
 impl OpenVpnManager {
     pub fn new(config: ConnectionConfig, event_tx: mpsc::Sender<VpnEvent>) -> Self {
-        let socket_path = PathBuf::from(format!("/tmp/nm-openvpn-sso-{}.sock", config.uuid));
+        // Same location as NetworkManager-openvpn's management socket: the openvpn
+        // AppArmor profile (e.g. on Ubuntu) allows @{run}/NetworkManager/nm-openvpn-*
+        // but denies creating the socket in /tmp.
+        let socket_path = PathBuf::from(format!(
+            "/run/NetworkManager/nm-openvpn-sso-{}.sock",
+            config.uuid
+        ));
 
         Self {
             config,
@@ -98,12 +214,28 @@ impl OpenVpnManager {
             event_tx,
             pending_auth_url: None,
             sso_auth_initiated: false,
+            sso_task: None,
             auth_token: None,
         }
     }
 
-    /// Start OpenVPN and manage the connection
+    /// Start OpenVPN and manage the connection.
+    ///
+    /// Returns when the management session ends. Any error is also reported as
+    /// `VpnEvent::Failed`, so NetworkManager learns about it right away instead
+    /// of waiting for its activation timeout.
     pub async fn connect(&mut self) -> Result<()> {
+        let result = self.start_and_manage().await;
+        if let Err(ref e) = result {
+            self.event_tx
+                .send(VpnEvent::Failed(e.to_string()))
+                .await
+                .ok();
+        }
+        result
+    }
+
+    async fn start_and_manage(&mut self) -> Result<()> {
         // Kill any stale openvpn processes using the same management socket
         self.kill_stale_openvpn_processes().await;
 
@@ -199,9 +331,13 @@ impl OpenVpnManager {
         let mut line = String::new();
 
         // State tracking
-        let mut vpn_config = VpnConfig::default();
+        // Environment of the last tunnel-up event (--management-up-down)
+        let mut tunnel_env: HashMap<String, String> = HashMap::new();
         let mut initial_auth_sent = false;
         let mut used_cached_token = false;
+        let mut connected = false;
+        // Why OpenVPN last restarted the connection (">STATE:...,RECONNECTING,<reason>")
+        let mut reconnect_reason: Option<String> = None;
 
         // Check for cached credentials before starting
         let cached_token = secrets::get_cached_credentials(&self.config.uuid).await;
@@ -227,11 +363,22 @@ impl OpenVpnManager {
 
             if n == 0 {
                 warn!("Management connection closed");
+                if !connected {
+                    // OpenVPN exited during startup or authentication
+                    // (e.g. AUTH_FAILED); there is no connection to report.
+                    return Err(anyhow!(
+                        "OpenVPN exited before the connection was established"
+                    ));
+                }
+                self.event_tx
+                    .send(VpnEvent::State(VpnState::Stopped))
+                    .await
+                    .ok();
                 break;
             }
 
             let line = line.trim();
-            info!("MGMT: {}", line);
+            info!("MGMT: {}", redact_tokens(line));
 
             // Parse management interface messages
             if line.starts_with(">PASSWORD:") {
@@ -246,6 +393,14 @@ impl OpenVpnManager {
                     if !token.is_empty() {
                         self.auth_token = Some(token.to_string());
                     }
+                    continue;
+                }
+
+                // Once connected, a failed verification means the server
+                // rejected the session token on renegotiation. OpenVPN
+                // restarts the connection next; see the >HOLD handling.
+                if connected && auth_type.contains("Verification Failed") {
+                    warn!("Server rejected the session credentials");
                     continue;
                 }
 
@@ -267,13 +422,9 @@ impl OpenVpnManager {
                             .await
                             .ok();
 
-                        if let Err(e) = self.handle_sso_auth(&mut writer, &url).await {
+                        if let Err(e) = self.start_browser_login(&url) {
                             error!("SSO authentication failed: {}", e);
-                            self.event_tx
-                                .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
-                                .await
-                                .ok();
-                            return Err(e);
+                            return Err(anyhow!("Auth failed: {}", e));
                         }
                     } else {
                         error!("Verification failed but no auth URL found in response");
@@ -357,7 +508,7 @@ impl OpenVpnManager {
                             {
                                 Ok(Ok(n)) if n > 0 => {
                                     let next_line = next_line.trim();
-                                    info!("MGMT (waiting for SSO): {}", next_line);
+                                    info!("MGMT (waiting for SSO): {}", redact_tokens(next_line));
 
                                     // Check for INFO or INFOMSG with auth URL
                                     if next_line.starts_with(">INFO:")
@@ -367,7 +518,7 @@ impl OpenVpnManager {
                                             .strip_prefix(">INFO:")
                                             .or_else(|| next_line.strip_prefix(">INFOMSG:"))
                                             .unwrap_or(next_line);
-                                        info!("Server INFO/MSG: {}", info);
+                                        info!("Server INFO/MSG: {}", redact_tokens(info));
                                         if let Some(url) = extract_auth_url(info) {
                                             info!("Received auth URL from server: {}", url);
                                             self.pending_auth_url = Some(url);
@@ -421,13 +572,9 @@ impl OpenVpnManager {
                                 .await
                                 .ok();
 
-                            if let Err(e) = self.handle_sso_auth(&mut writer, &url).await {
+                            if let Err(e) = self.start_browser_login(&url) {
                                 error!("SSO authentication failed: {}", e);
-                                self.event_tx
-                                    .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
-                                    .await
-                                    .ok();
-                                return Err(e);
+                                return Err(anyhow!("Auth failed: {}", e));
                             }
                         } else if wait_start.elapsed() >= max_wait {
                             warn!(
@@ -454,11 +601,7 @@ impl OpenVpnManager {
                     // Attempt authentication
                     if let Err(e) = self.handle_auth(&mut writer, auth_url.as_deref()).await {
                         error!("Authentication failed: {}", e);
-                        self.event_tx
-                            .send(VpnEvent::Failed(format!("Auth failed: {}", e)))
-                            .await
-                            .ok();
-                        return Err(e);
+                        return Err(anyhow!("Auth failed: {}", e));
                     }
                 }
             } else if line.starts_with(">STATE:") {
@@ -503,41 +646,8 @@ impl OpenVpnManager {
                                     .ok();
 
                                 // Start localhost callback server + open browser for SSO
-                                if !self.sso_auth_initiated {
-                                    self.sso_auth_initiated = true;
-
-                                    // Extract server base URL from auth URL for POSTing back
-                                    let server_base = match url::Url::parse(&url) {
-                                        Ok(u) => format!(
-                                            "{}://{}:{}",
-                                            u.scheme(),
-                                            u.host_str().unwrap_or(""),
-                                            u.port().unwrap_or(9000)
-                                        ),
-                                        Err(e) => {
-                                            error!("Failed to parse auth URL: {}", e);
-                                            url.clone()
-                                        }
-                                    };
-
-                                    // Spawn the SSO flow (localhost server + browser + POST)
-                                    // in a background task so the management loop continues
-                                    let url_clone = url.clone();
-                                    tokio::spawn(async move {
-                                        match crate::oauth::authenticate_sso(
-                                            &url_clone,
-                                            &server_base,
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {
-                                                info!("SSO authentication completed successfully")
-                                            }
-                                            Err(e) => error!("SSO authentication failed: {}", e),
-                                        }
-                                    });
-                                } else {
-                                    info!("SSO auth already initiated, skipping duplicate");
+                                if let Err(e) = self.start_browser_login(&url) {
+                                    error!("Failed to start SSO login: {}", e);
                                 }
                             } else {
                                 warn!(
@@ -558,11 +668,21 @@ impl OpenVpnManager {
                                 .ok();
                         }
                         "CONNECTED" => {
-                            if parts.len() >= 4 {
-                                vpn_config.local_ip = Some(parts[3].to_string());
+                            // Servers that complete the web login themselves (e.g.
+                            // openvpn-auth-oauth2) never call back to localhost.
+                            self.stop_browser_login();
+                            connected = true;
+
+                            let mut vpn_config = VpnConfig::from_openvpn_env(&tunnel_env);
+                            // Fall back to the addresses in the CONNECTED state
+                            // (">STATE:time,CONNECTED,SUCCESS,local,remote,...").
+                            if vpn_config.local_ip.is_none() {
+                                vpn_config.local_ip = parts.get(3).and_then(|ip| ip.parse().ok());
+                                vpn_config.prefix = vpn_config.local_ip.map(|_| 32);
                             }
-                            if parts.len() >= 5 {
-                                vpn_config.remote_ip = Some(parts[4].to_string());
+                            if vpn_config.external_gateway.is_none() {
+                                vpn_config.external_gateway =
+                                    parts.get(4).and_then(|ip| ip.parse().ok());
                             }
 
                             // Save credentials for future reconnections
@@ -577,7 +697,16 @@ impl OpenVpnManager {
                                 .await
                                 .ok();
                         }
-                        "EXITING" | "RECONNECTING" => {
+                        "RECONNECTING" => {
+                            reconnect_reason = parts.get(2).map(|r| r.to_string());
+                            // NetworkManager treats Started -> Starting as a
+                            // reconnect and shows the connection as connecting.
+                            self.event_tx
+                                .send(VpnEvent::State(VpnState::Starting))
+                                .await
+                                .ok();
+                        }
+                        "EXITING" => {
                             self.event_tx
                                 .send(VpnEvent::State(VpnState::Stopping))
                                 .await
@@ -586,13 +715,25 @@ impl OpenVpnManager {
                         _ => {}
                     }
                 }
+            } else if let Some(updown) = line.strip_prefix(">UPDOWN:") {
+                // Tunnel up/down notification (--management-up-down): "UP" or
+                // "DOWN", then the script environment as "ENV,name=value"
+                // lines terminated by "ENV,END".
+                if updown == "UP" {
+                    tunnel_env.clear();
+                } else if let Some((name, value)) = updown
+                    .strip_prefix("ENV,")
+                    .and_then(|var| var.split_once('='))
+                {
+                    tunnel_env.insert(name.to_string(), value.to_string());
+                }
             } else if line.starts_with(">INFO:") || line.starts_with(">INFOMSG:") {
                 // Info message (may contain web-auth URL or auth-token)
                 let info = line
                     .strip_prefix(">INFO:")
                     .or_else(|| line.strip_prefix(">INFOMSG:"))
                     .unwrap_or(line);
-                info!("Server INFO: {}", info);
+                info!("Server INFO: {}", redact_tokens(info));
 
                 // Check for auth-token (used for reconnection)
                 if let Some(token) = extract_auth_token(info) {
@@ -621,6 +762,23 @@ impl OpenVpnManager {
                         }
                     }
                 }
+            } else if line.starts_with(">HOLD:") {
+                // With --management-hold OpenVPN waits for "hold release" after
+                // every restart, not only at startup. The startup hold was
+                // released above already.
+                if connected {
+                    if let Some(reason) = reconnect_reason.as_deref().filter(|r| needs_new_login(r))
+                    {
+                        // Reconnecting would only resend the rejected token;
+                        // the user has to log in again in the browser.
+                        return Err(anyhow!(
+                            "The server ended the VPN session ({}); connect again to log in",
+                            reason
+                        ));
+                    }
+                    info!("Releasing hold so OpenVPN reconnects");
+                    writer.write_all(b"hold release\n").await?;
+                }
             } else if line.starts_with(">BYTECOUNT:") {
                 // Byte count - connection is active
             } else if line.starts_with("SUCCESS:") {
@@ -630,10 +788,6 @@ impl OpenVpnManager {
             } else if line.starts_with(">FATAL:") {
                 let msg = line.strip_prefix(">FATAL:").unwrap_or(line);
                 error!("OpenVPN fatal error: {}", msg);
-                self.event_tx
-                    .send(VpnEvent::Failed(msg.to_string()))
-                    .await
-                    .ok();
                 return Err(anyhow!("OpenVPN fatal: {}", msg));
             } else if line.starts_with(">LOG:") {
                 let log = line.strip_prefix(">LOG:").unwrap_or(line);
@@ -679,10 +833,10 @@ impl OpenVpnManager {
         };
 
         // Perform SSO auth with the URL
-        self.handle_sso_auth(writer, url).await
+        self.start_browser_login(url)
     }
 
-    /// Handle SSO/browser-based authentication
+    /// Start the browser-based SSO login in a background task.
     ///
     /// The flow:
     /// 1. Start a localhost HTTP server on port 19823 to receive the OAuth callback
@@ -691,11 +845,13 @@ impl OpenVpnManager {
     /// 4. We receive the auth code and POST it to the VPN server's /auth/complete
     /// 5. The VPN server exchanges the code for a token, verifies the user, and
     ///    completes the VPN authentication by sending PUSH_REPLY
-    async fn handle_sso_auth(
-        &mut self,
-        _writer: &mut tokio::net::unix::OwnedWriteHalf,
-        auth_url: &str,
-    ) -> Result<()> {
+    ///
+    /// Servers implementing standard OpenVPN web auth (WEB_AUTH/OPEN_URL, e.g.
+    /// openvpn-auth-oauth2) complete the login themselves and never call back to
+    /// localhost. Either way the outcome is reported through the management
+    /// interface, so this must not block the management loop: it returns right
+    /// away, and the task is stopped once OpenVPN reports CONNECTED.
+    fn start_browser_login(&mut self, auth_url: &str) -> Result<()> {
         // Prevent duplicate browser launches
         if self.sso_auth_initiated {
             info!("SSO auth already initiated, skipping duplicate browser open");
@@ -703,7 +859,6 @@ impl OpenVpnManager {
         }
 
         info!("Starting SSO authentication with URL: {}", auth_url);
-        self.sso_auth_initiated = true;
 
         // Extract the VPN server host from the auth URL for later POSTing
         // auth_url looks like: http://34.214.23.25:9000/auth/start?state=...
@@ -714,24 +869,24 @@ impl OpenVpnManager {
                 u.host_str().unwrap_or(""),
                 u.port().unwrap_or(9000)
             ),
-            Err(_) => {
-                self.sso_auth_initiated = false;
-                return Err(anyhow!("Invalid auth URL: {}", auth_url));
-            }
+            Err(_) => return Err(anyhow!("Invalid auth URL: {}", auth_url)),
         };
 
-        // Start the localhost callback server and open the browser concurrently
-        use crate::oauth;
-        match oauth::authenticate_sso(auth_url, &server_base_url).await {
-            Ok(()) => {
-                info!("SSO authentication flow completed");
-                Ok(())
+        self.sso_auth_initiated = true;
+        let auth_url = auth_url.to_string();
+        self.sso_task = Some(tokio::spawn(async move {
+            match crate::oauth::authenticate_sso(&auth_url, &server_base_url).await {
+                Ok(()) => info!("SSO authentication flow completed"),
+                Err(e) => error!("SSO authentication failed: {}", e),
             }
-            Err(e) => {
-                error!("SSO authentication failed: {}", e);
-                self.sso_auth_initiated = false;
-                Err(anyhow!("SSO authentication failed: {}", e))
-            }
+        }));
+        Ok(())
+    }
+
+    /// Stop a running browser login task (and its localhost callback server).
+    fn stop_browser_login(&mut self) {
+        if let Some(task) = self.sso_task.take() {
+            task.abort();
         }
     }
 
@@ -757,6 +912,8 @@ impl OpenVpnManager {
 
     /// Disconnect the VPN
     pub async fn disconnect(&mut self) -> Result<()> {
+        self.stop_browser_login();
+
         if let Some(ref mut child) = self.process {
             info!("Stopping OpenVPN process");
 
@@ -803,10 +960,8 @@ impl OpenVpnManager {
     /// Save credentials after successful connection for future reconnections
     async fn save_credentials_after_connect(&self) {
         info!(
-            "save_credentials_after_connect called, auth_token={:?}, pending_auth_url={:?}",
-            self.auth_token
-                .as_ref()
-                .map(|t| format!("{}...", &t[..t.len().min(20)])),
+            "save_credentials_after_connect called, has_auth_token={}, pending_auth_url={:?}",
+            self.auth_token.is_some(),
             self.pending_auth_url.is_some()
         );
         // Prefer auth_token if we received one from the server
@@ -897,6 +1052,13 @@ fn extract_auth_token(message: &str) -> Option<String> {
     None
 }
 
+/// Whether OpenVPN restarted the connection because the server rejected our
+/// credentials (">STATE:...,RECONNECTING,auth-failure (auth-token)"), so only a
+/// new browser login can bring the tunnel back.
+fn needs_new_login(reconnect_reason: &str) -> bool {
+    reconnect_reason.starts_with("auth-failure")
+}
+
 /// Extract OPEN_URL from an OpenVPN AUTH_PENDING state message.
 /// The state details may look like: "timeout 120,OPEN_URL:http://host:port/path?query"
 fn extract_open_url(message: &str) -> Option<String> {
@@ -964,6 +1126,45 @@ fn extract_auth_url(message: &str) -> Option<String> {
     None
 }
 
+/// Hide session tokens in management lines before they are logged.
+///
+/// The server's auth-token (">PASSWORD:Auth-Token:SESS_ID_...", "auth-token,..."
+/// in pushed options, "AUTH_TOKEN:...") lets anyone reconnect without logging in,
+/// so it must not end up in the system journal.
+fn redact_tokens(line: &str) -> String {
+    let lower = line.to_ascii_lowercase();
+    let mut result = String::with_capacity(line.len());
+    let mut pos = 0;
+    while let Some(found) = ["auth-token", "auth_token"]
+        .iter()
+        .filter_map(|marker| lower[pos..].find(marker).map(|i| pos + i + marker.len()))
+        .min()
+    {
+        // Keep the marker and its separator, drop the value up to the next
+        // separator. Without a separator the marker is just a word, as in
+        // "RECONNECTING,auth-failure (auth-token)".
+        let value_start = match line[found..].chars().next() {
+            Some(':') | Some(',') | Some(' ') => found + 1,
+            _ => {
+                result.push_str(&line[pos..found]);
+                pos = found;
+                continue;
+            }
+        };
+        let value_end = line[value_start..]
+            .find([',', ' '])
+            .map(|i| value_start + i)
+            .unwrap_or(line.len());
+        result.push_str(&line[pos..value_start]);
+        if value_end > value_start {
+            result.push_str("[redacted]");
+        }
+        pos = value_end;
+    }
+    result.push_str(&line[pos..]);
+    result
+}
+
 /// Escape special characters for the management interface
 fn escape_management_string(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -974,6 +1175,126 @@ fn escape_management_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- VpnConfig::from_openvpn_env ------------------------------------------
+
+    fn env(vars: &[(&str, &str)]) -> HashMap<String, String> {
+        vars.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn ip(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn from_openvpn_env_net30_topology_with_routes_and_dns() {
+        let config = VpnConfig::from_openvpn_env(&env(&[
+            ("dev", "tun0"),
+            ("trusted_ip", "80.150.73.4"),
+            ("ifconfig_local", "10.20.93.66"),
+            ("ifconfig_remote", "10.20.93.65"),
+            ("route_vpn_gateway", "10.20.93.65"),
+            ("tun_mtu", "1500"),
+            ("route_network_1", "10.20.10.0"),
+            ("route_netmask_1", "255.255.255.0"),
+            ("route_gateway_1", "10.20.93.65"),
+            ("route_network_2", "10.20.20.0"),
+            ("route_netmask_2", "255.255.255.0"),
+            ("route_gateway_2", "10.20.93.65"),
+            ("route_metric_2", "50"),
+            (
+                "foreign_option_1",
+                "dhcp-option DOMAIN-SEARCH intern.example.com",
+            ),
+            ("foreign_option_2", "dhcp-option DNS 10.20.20.1"),
+            ("foreign_option_3", "dhcp-option DOMAIN example.com"),
+            ("foreign_option_4", "block-outside-dns"),
+        ]));
+
+        assert_eq!(config.tun_device.as_deref(), Some("tun0"));
+        assert_eq!(config.external_gateway, Some(ip("80.150.73.4")));
+        assert_eq!(config.local_ip, Some(ip("10.20.93.66")));
+        assert_eq!(config.ptp, Some(ip("10.20.93.65")));
+        assert_eq!(config.prefix, Some(32));
+        assert_eq!(config.internal_gateway, Some(ip("10.20.93.65")));
+        assert_eq!(config.mtu, Some(1500));
+        assert_eq!(
+            config.routes,
+            vec![
+                Route {
+                    network: ip("10.20.10.0"),
+                    prefix: 24,
+                    gateway: Some(ip("10.20.93.65")),
+                    metric: 0,
+                },
+                Route {
+                    network: ip("10.20.20.0"),
+                    prefix: 24,
+                    gateway: Some(ip("10.20.93.65")),
+                    metric: 50,
+                },
+            ]
+        );
+        assert_eq!(config.dns_servers, vec![ip("10.20.20.1")]);
+        // DOMAIN entries come first, then DOMAIN-SEARCH
+        assert_eq!(config.domains, vec!["example.com", "intern.example.com"]);
+    }
+
+    #[test]
+    fn from_openvpn_env_subnet_topology_takes_prefix_from_netmask_in_ifconfig_remote() {
+        let config = VpnConfig::from_openvpn_env(&env(&[
+            ("dev", "tun1"),
+            ("ifconfig_local", "10.8.0.6"),
+            ("ifconfig_remote", "255.255.255.0"),
+        ]));
+
+        assert_eq!(config.local_ip, Some(ip("10.8.0.6")));
+        assert_eq!(config.ptp, None);
+        assert_eq!(config.prefix, Some(24));
+    }
+
+    #[test]
+    fn from_openvpn_env_prefers_ifconfig_netmask() {
+        let config = VpnConfig::from_openvpn_env(&env(&[
+            ("dev", "tap0"),
+            ("ifconfig_local", "192.168.5.10"),
+            ("ifconfig_netmask", "255.255.252.0"),
+        ]));
+
+        assert_eq!(config.prefix, Some(22));
+    }
+
+    #[test]
+    fn from_openvpn_env_skips_invalid_routes_and_stops_at_first_gap() {
+        let config = VpnConfig::from_openvpn_env(&env(&[
+            ("route_network_1", "not-an-ip"),
+            ("route_netmask_1", "255.255.255.0"),
+            ("route_network_2", "10.1.0.0"),
+            ("route_netmask_2", "255.255.0.0"),
+            ("route_network_4", "10.2.0.0"),
+            ("route_netmask_4", "255.255.0.0"),
+        ]));
+
+        assert_eq!(
+            config.routes,
+            vec![Route {
+                network: ip("10.1.0.0"),
+                prefix: 16,
+                gateway: None,
+                metric: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn from_openvpn_env_without_variables_is_empty() {
+        assert_eq!(
+            VpnConfig::from_openvpn_env(&HashMap::new()),
+            VpnConfig::default()
+        );
+    }
 
     // -- extract_auth_url -------------------------------------------------
 
@@ -1017,6 +1338,16 @@ mod tests {
     fn extract_auth_url_returns_none_when_no_url_present() {
         let msg = "Verification Failed: no url in this message at all";
         assert_eq!(extract_auth_url(msg), None);
+    }
+
+    // -- needs_new_login ----------------------------------------------------
+
+    #[test]
+    fn needs_new_login_after_rejected_credentials() {
+        assert!(needs_new_login("auth-failure (auth-token)"));
+        assert!(needs_new_login("auth-failure"));
+        assert!(!needs_new_login("ping-restart"));
+        assert!(!needs_new_login("connection-reset"));
     }
 
     // -- extract_open_url ---------------------------------------------------
@@ -1071,6 +1402,40 @@ mod tests {
         assert_eq!(extract_auth_token(msg), None);
     }
 
+    // -- redact_tokens ------------------------------------------------------
+
+    #[test]
+    fn redact_tokens_hides_auth_token_password_line() {
+        assert_eq!(
+            redact_tokens(">PASSWORD:Auth-Token:SESS_ID_AT_Axc0gorcKywz"),
+            ">PASSWORD:Auth-Token:[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_tokens_hides_pushed_auth_token_and_keeps_other_options() {
+        assert_eq!(
+            redact_tokens("PUSH_REPLY,route 10.0.0.0,auth-token SESS_ID_AT_abc,ping 10"),
+            "PUSH_REPLY,route 10.0.0.0,auth-token [redacted],ping 10"
+        );
+        assert_eq!(
+            redact_tokens("auth-token,SESS_ID_AT_abc,auth_token:xyz"),
+            "auth-token,[redacted],auth_token:[redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_tokens_leaves_lines_without_tokens_unchanged() {
+        let line = ">STATE:1793908794,CONNECTED,SUCCESS,10.20.93.78,80.150.73.4,11194,,";
+        assert_eq!(redact_tokens(line), line);
+    }
+
+    #[test]
+    fn redact_tokens_leaves_marker_without_value_unchanged() {
+        let line = ">STATE:1794002794,RECONNECTING,auth-failure (auth-token),,,,,";
+        assert_eq!(redact_tokens(line), line);
+    }
+
     // -- escape_management_string --------------------------------------------
 
     #[test]
@@ -1097,6 +1462,8 @@ mod tests {
 
 impl Drop for OpenVpnManager {
     fn drop(&mut self) {
+        self.stop_browser_login();
+
         if let Some(ref mut child) = self.process {
             // Best effort cleanup
             let _ = child.start_kill();
