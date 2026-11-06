@@ -336,6 +336,8 @@ impl OpenVpnManager {
         let mut initial_auth_sent = false;
         let mut used_cached_token = false;
         let mut connected = false;
+        // Why OpenVPN last restarted the connection (">STATE:...,RECONNECTING,<reason>")
+        let mut reconnect_reason: Option<String> = None;
 
         // Check for cached credentials before starting
         let cached_token = secrets::get_cached_credentials(&self.config.uuid).await;
@@ -391,6 +393,14 @@ impl OpenVpnManager {
                     if !token.is_empty() {
                         self.auth_token = Some(token.to_string());
                     }
+                    continue;
+                }
+
+                // Once connected, a failed verification means the server
+                // rejected the session token on renegotiation. OpenVPN
+                // restarts the connection next; see the >HOLD handling.
+                if connected && auth_type.contains("Verification Failed") {
+                    warn!("Server rejected the session credentials");
                     continue;
                 }
 
@@ -687,7 +697,16 @@ impl OpenVpnManager {
                                 .await
                                 .ok();
                         }
-                        "EXITING" | "RECONNECTING" => {
+                        "RECONNECTING" => {
+                            reconnect_reason = parts.get(2).map(|r| r.to_string());
+                            // NetworkManager treats Started -> Starting as a
+                            // reconnect and shows the connection as connecting.
+                            self.event_tx
+                                .send(VpnEvent::State(VpnState::Starting))
+                                .await
+                                .ok();
+                        }
+                        "EXITING" => {
                             self.event_tx
                                 .send(VpnEvent::State(VpnState::Stopping))
                                 .await
@@ -742,6 +761,23 @@ impl OpenVpnManager {
                             warn!("Failed to open browser for SSO: {}", e);
                         }
                     }
+                }
+            } else if line.starts_with(">HOLD:") {
+                // With --management-hold OpenVPN waits for "hold release" after
+                // every restart, not only at startup. The startup hold was
+                // released above already.
+                if connected {
+                    if let Some(reason) = reconnect_reason.as_deref().filter(|r| needs_new_login(r))
+                    {
+                        // Reconnecting would only resend the rejected token;
+                        // the user has to log in again in the browser.
+                        return Err(anyhow!(
+                            "The server ended the VPN session ({}); connect again to log in",
+                            reason
+                        ));
+                    }
+                    info!("Releasing hold so OpenVPN reconnects");
+                    writer.write_all(b"hold release\n").await?;
                 }
             } else if line.starts_with(">BYTECOUNT:") {
                 // Byte count - connection is active
@@ -1014,6 +1050,13 @@ fn extract_auth_token(message: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Whether OpenVPN restarted the connection because the server rejected our
+/// credentials (">STATE:...,RECONNECTING,auth-failure (auth-token)"), so only a
+/// new browser login can bring the tunnel back.
+fn needs_new_login(reconnect_reason: &str) -> bool {
+    reconnect_reason.starts_with("auth-failure")
 }
 
 /// Extract OPEN_URL from an OpenVPN AUTH_PENDING state message.
@@ -1290,6 +1333,16 @@ mod tests {
     fn extract_auth_url_returns_none_when_no_url_present() {
         let msg = "Verification Failed: no url in this message at all";
         assert_eq!(extract_auth_url(msg), None);
+    }
+
+    // -- needs_new_login ----------------------------------------------------
+
+    #[test]
+    fn needs_new_login_after_rejected_credentials() {
+        assert!(needs_new_login("auth-failure (auth-token)"));
+        assert!(needs_new_login("auth-failure"));
+        assert!(!needs_new_login("ping-restart"));
+        assert!(!needs_new_login("connection-reset"));
     }
 
     // -- extract_open_url ---------------------------------------------------

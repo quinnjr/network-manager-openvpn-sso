@@ -133,6 +133,11 @@ impl VpnPlugin {
                     }
                     Some(Err(e)) => {
                         error!("VPN connection failed: {}", e);
+                        // OpenVPN may still be running, e.g. waiting for a hold
+                        // release after the server rejected the session.
+                        if let Err(e) = mgr.disconnect().await {
+                            warn!("Error during disconnect: {}", e);
+                        }
                         let mut state = state_clone.write().await;
                         state.state = NMVpnServiceState::Stopped;
                     }
