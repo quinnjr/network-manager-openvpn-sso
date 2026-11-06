@@ -58,6 +58,9 @@ mkdir -p "$BIN_DIR"
 info "Installing binary to $NM_PLUGIN_DIR..."
 install -m 755 "$BINARY" "$NM_PLUGIN_DIR/nm-openvpn-sso-service"
 
+# Older versions cached session tokens here; nothing uses them anymore
+rm -rf /var/lib/nm-openvpn-sso
+
 # Install NetworkManager plugin file
 info "Installing NetworkManager plugin configuration..."
 install -m 644 data/nm-openvpn-sso-service.name "$NM_VPN_DIR/"

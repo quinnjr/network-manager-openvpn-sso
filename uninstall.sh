@@ -28,6 +28,7 @@ rm -f "$PREFIX/share/dbus-1/system.d/org.freedesktop.NetworkManager.openvpn-sso.
 rm -f "$PREFIX/bin/vpn-sso-connect"
 rm -f "$PREFIX/share/applications/vpn-sso-connect.desktop"
 rm -f "$LIBDIR/qt6/plugins/plasma/network/vpn/plasmanetworkmanagement_openvpnssoui.so"
+rm -rf /var/lib/nm-openvpn-sso
 
 info "Reloading daemons..."
 systemctl daemon-reload

@@ -5,7 +5,6 @@ mod config;
 mod dbus;
 mod oauth;
 mod openvpn;
-mod secrets;
 
 use anyhow::Result;
 use tracing::info;

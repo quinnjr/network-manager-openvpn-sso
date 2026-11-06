@@ -28,9 +28,6 @@ tower = "0.5"
 # HTTP client for forwarding OAuth code to VPN server
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
-# Secrets/keyring
-secret-service = { version = "5", features = ["rt-tokio-crypto-rust"] }
-
 # Browser opening
 open = "5"
 

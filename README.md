@@ -10,7 +10,6 @@ A NetworkManager VPN plugin that adds OAuth 2.0 / OIDC Single Sign-On (SSO) supp
 
 - **Browser-based SSO authentication** - Opens your default browser for OAuth/OIDC login
 - **Automatic OAuth discovery** - Discovers authentication URLs from the OpenVPN server
-- **Session token caching** - Caches session tokens (via Secret Service, with an encrypted-file fallback) for up to 24 hours, so reconnecting doesn't always require a fresh browser SSO round-trip
 - **Desktop notifications** - Shows connection status via system notifications
 - **Full NetworkManager integration** - Works seamlessly with NetworkManager and network applets
 
@@ -143,7 +142,7 @@ sudo ./uninstall.sh
 
 ## Configuration
 
-After a successful login, the plugin caches the session token — preferring the Secret Service keyring, and falling back to `/var/lib/nm-openvpn-sso/` (mode `0700` directory, `0600` file) when a keyring isn't available (e.g. running as root under NetworkManager). The cached token is valid for up to 24 hours: on a subsequent connection attempt, if a valid cached token exists it is sent to the server directly and the browser is not opened; full browser-based SSO only runs again once the cached token has expired or no cached token exists. Security tradeoff: this means a cached token lets anyone able to trigger a reconnect on that machine connect without re-authenticating for up to 24 hours, which is why the cache is kept in the keyring where possible and restricted to owner-only permissions otherwise.
+The plugin doesn't store session tokens. Each connection starts with a browser login, and the session then lasts as long as the server allows: OpenVPN renews it on renegotiation with the token the server issued (`auth-gen-token`). When the server rejects that token, the plugin ends the connection and NetworkManager reports it as failed; connect again to log in.
 
 ## Troubleshooting
 
