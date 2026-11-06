@@ -15,7 +15,6 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::config::ConnectionConfig;
-use crate::secrets;
 
 /// Events from the OpenVPN management interface
 #[derive(Debug, Clone)]
@@ -192,9 +191,6 @@ pub struct OpenVpnManager {
     sso_auth_initiated: bool,
     /// Background task running the browser login (see `start_browser_login`)
     sso_task: Option<tokio::task::JoinHandle<()>>,
-    /// Auth token received from server after successful authentication
-    /// This can be used for reconnection without browser auth
-    auth_token: Option<String>,
 }
 
 impl OpenVpnManager {
@@ -215,7 +211,6 @@ impl OpenVpnManager {
             pending_auth_url: None,
             sso_auth_initiated: false,
             sso_task: None,
-            auth_token: None,
         }
     }
 
@@ -334,19 +329,9 @@ impl OpenVpnManager {
         // Environment of the last tunnel-up event (--management-up-down)
         let mut tunnel_env: HashMap<String, String> = HashMap::new();
         let mut initial_auth_sent = false;
-        let mut used_cached_token = false;
         let mut connected = false;
         // Why OpenVPN last restarted the connection (">STATE:...,RECONNECTING,<reason>")
         let mut reconnect_reason: Option<String> = None;
-
-        // Check for cached credentials before starting
-        let cached_token = secrets::get_cached_credentials(&self.config.uuid).await;
-        if cached_token.is_some() {
-            info!(
-                "Found cached credentials for connection {}",
-                self.config.uuid
-            );
-        }
 
         // Send initial commands
         writer.write_all(b"state on\n").await?;
@@ -385,14 +370,11 @@ impl OpenVpnManager {
                 // Password/auth required or auth-token received
                 let auth_type = line.strip_prefix(">PASSWORD:").unwrap().trim();
 
-                // Check if this is an Auth-Token (sent by server after successful auth)
-                // Format: >PASSWORD:Auth-Token:SESS_ID_AT_...
+                // The server's session token (">PASSWORD:Auth-Token:..."). OpenVPN
+                // keeps it in memory and uses it on renegotiation by itself. We
+                // don't store it: a later connection presenting it would inherit
+                // this session's start time, and with it the server's expiry.
                 if auth_type.starts_with("Auth-Token:") {
-                    let token = auth_type.strip_prefix("Auth-Token:").unwrap().trim();
-                    info!("Received Auth-Token from server (length: {})", token.len());
-                    if !token.is_empty() {
-                        self.auth_token = Some(token.to_string());
-                    }
                     continue;
                 }
 
@@ -444,35 +426,6 @@ impl OpenVpnManager {
 
                     // First time we get password request
                     if !initial_auth_sent {
-                        // Try cached credentials first if available
-                        if let Some(ref tokens) = cached_token {
-                            if tokens.is_valid() && !used_cached_token {
-                                info!("Attempting authentication with cached token");
-                                used_cached_token = true;
-
-                                let username = self.config.username.as_deref().unwrap_or("sso");
-                                writer
-                                    .write_all(
-                                        format!("username \"Auth\" \"{}\"\n", username).as_bytes(),
-                                    )
-                                    .await?;
-                                writer
-                                    .write_all(
-                                        format!(
-                                            "password \"Auth\" \"{}\"\n",
-                                            escape_management_string(&tokens.access_token)
-                                        )
-                                        .as_bytes(),
-                                    )
-                                    .await?;
-                                writer.flush().await?;
-
-                                initial_auth_sent = true;
-                                info!("Sent cached credentials, waiting for server response...");
-                                continue;
-                            }
-                        }
-
                         info!(
                             "Sending initial placeholder credentials to initiate TLS handshake..."
                         );
@@ -599,7 +552,7 @@ impl OpenVpnManager {
                         .ok();
 
                     // Attempt authentication
-                    if let Err(e) = self.handle_auth(&mut writer, auth_url.as_deref()).await {
+                    if let Err(e) = self.handle_auth(auth_url.as_deref()).await {
                         error!("Authentication failed: {}", e);
                         return Err(anyhow!("Auth failed: {}", e));
                     }
@@ -685,9 +638,6 @@ impl OpenVpnManager {
                                     parts.get(4).and_then(|ip| ip.parse().ok());
                             }
 
-                            // Save credentials for future reconnections
-                            self.save_credentials_after_connect().await;
-
                             self.event_tx
                                 .send(VpnEvent::State(VpnState::Connected))
                                 .await
@@ -728,18 +678,12 @@ impl OpenVpnManager {
                     tunnel_env.insert(name.to_string(), value.to_string());
                 }
             } else if line.starts_with(">INFO:") || line.starts_with(">INFOMSG:") {
-                // Info message (may contain web-auth URL or auth-token)
+                // Info message (may contain a web-auth URL)
                 let info = line
                     .strip_prefix(">INFO:")
                     .or_else(|| line.strip_prefix(">INFOMSG:"))
                     .unwrap_or(line);
                 info!("Server INFO: {}", redact_tokens(info));
-
-                // Check for auth-token (used for reconnection)
-                if let Some(token) = extract_auth_token(info) {
-                    info!("Received auth-token from server (length: {})", token.len());
-                    self.auth_token = Some(token);
-                }
 
                 // Check for auth URL
                 if let Some(url) = extract_auth_url(info) {
@@ -753,9 +697,8 @@ impl OpenVpnManager {
                         .ok();
 
                     // If we haven't already started SSO, open browser now
-                    // This handles the case where cached token was rejected and server sends new SSO URL
                     if !self.sso_auth_initiated {
-                        info!("Server sent SSO URL after cached token rejected, opening browser");
+                        info!("Server sent SSO URL, opening browser");
                         self.sso_auth_initiated = true;
                         if let Err(e) = crate::oauth::authenticate(&url, None).await {
                             warn!("Failed to open browser for SSO: {}", e);
@@ -802,20 +745,7 @@ impl OpenVpnManager {
     }
 
     /// Handle authentication request (fallback for when no SSO URL is available)
-    async fn handle_auth(
-        &mut self,
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
-        auth_url: Option<&str>,
-    ) -> Result<()> {
-        // First, check for cached credentials
-        if let Some(tokens) = secrets::get_cached_credentials(&self.config.uuid).await {
-            if tokens.is_valid() {
-                info!("Using cached credentials");
-                return self.send_credentials(writer, &tokens.access_token).await;
-            }
-        }
-
-        // No valid cached credentials, need to do browser auth
+    async fn handle_auth(&mut self, auth_url: Option<&str>) -> Result<()> {
         info!("Starting browser authentication");
 
         // Check if we have an auth URL
@@ -890,26 +820,6 @@ impl OpenVpnManager {
         }
     }
 
-    /// Send credentials to OpenVPN via management interface
-    async fn send_credentials(
-        &self,
-        writer: &mut tokio::net::unix::OwnedWriteHalf,
-        token: &str,
-    ) -> Result<()> {
-        // Send username (often ignored for SSO)
-        writer.write_all(b"username \"Auth\" \"sso\"\n").await?;
-
-        // Send the token as the password
-        let password_cmd = format!(
-            "password \"Auth\" \"{}\"\n",
-            escape_management_string(token)
-        );
-        writer.write_all(password_cmd.as_bytes()).await?;
-
-        info!("Sent SSO credentials to OpenVPN");
-        Ok(())
-    }
-
     /// Disconnect the VPN
     pub async fn disconnect(&mut self) -> Result<()> {
         self.stop_browser_login();
@@ -956,100 +866,6 @@ impl OpenVpnManager {
             false
         }
     }
-
-    /// Save credentials after successful connection for future reconnections
-    async fn save_credentials_after_connect(&self) {
-        info!(
-            "save_credentials_after_connect called, has_auth_token={}, pending_auth_url={:?}",
-            self.auth_token.is_some(),
-            self.pending_auth_url.is_some()
-        );
-        // Prefer auth_token if we received one from the server
-        let token_to_save = if let Some(ref token) = self.auth_token {
-            info!("Saving auth-token received from server");
-            Some(token.clone())
-        } else if let Some(ref url) = self.pending_auth_url {
-            // If we did browser auth, create a marker token indicating successful SSO
-            // The actual session is maintained server-side, but we track that auth was done
-            info!("Saving SSO session marker for URL: {}", url);
-            // Use a hash of the URL as a session identifier
-            Some(format!("sso-session:{}", url))
-        } else {
-            None
-        };
-
-        if let Some(token) = token_to_save {
-            let tokens = secrets::StoredTokens {
-                access_token: token,
-                refresh_token: None,
-                // Auth tokens from OpenVPN servers typically last 24-48 hours
-                // Set expiry to 24 hours from now
-                expires_at: Some(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64 + 86400) // 24 hours
-                        .unwrap_or(0),
-                ),
-            };
-
-            match secrets::cache_credentials(&self.config.uuid, tokens).await {
-                Ok(()) => info!(
-                    "Successfully cached credentials for connection {}",
-                    self.config.uuid
-                ),
-                Err(e) => warn!("Failed to cache credentials: {}", e),
-            }
-        } else {
-            info!("No credentials to cache after connection");
-        }
-    }
-}
-
-/// Extract auth-token from OpenVPN server messages
-/// Auth tokens can be sent via various formats:
-/// - AUTH_TOKEN:token_value
-/// - auth-token,token_value
-/// - push-reply with auth-token
-fn extract_auth_token(message: &str) -> Option<String> {
-    // Pattern 1: AUTH_TOKEN:value or AUTH-TOKEN:value
-    if let Some(pos) = message.to_uppercase().find("AUTH_TOKEN:") {
-        let start = pos + "AUTH_TOKEN:".len();
-        let token = message[start..]
-            .split_whitespace()
-            .next()
-            .map(|s| s.trim_matches(|c| c == '"' || c == '\'' || c == ','));
-        if let Some(t) = token {
-            if !t.is_empty() {
-                return Some(t.to_string());
-            }
-        }
-    }
-
-    // Pattern 2: auth-token,value (OpenVPN PUSH format)
-    if let Some(pos) = message.find("auth-token,") {
-        let start = pos + "auth-token,".len();
-        let token = message[start..]
-            .split(|c: char| c.is_whitespace() || c == ',')
-            .next()
-            .map(|s| s.trim_matches(|c| c == '"' || c == '\''));
-        if let Some(t) = token {
-            if !t.is_empty() {
-                return Some(t.to_string());
-            }
-        }
-    }
-
-    // Pattern 3: CR_RESPONSE with session token
-    if message.starts_with("CR_RESPONSE:") {
-        let token = message.strip_prefix("CR_RESPONSE:").map(|s| s.trim());
-        if let Some(t) = token {
-            if !t.is_empty() {
-                return Some(t.to_string());
-            }
-        }
-    }
-
-    None
 }
 
 /// Whether OpenVPN restarted the connection because the server rejected our
@@ -1163,13 +979,6 @@ fn redact_tokens(line: &str) -> String {
     }
     result.push_str(&line[pos..]);
     result
-}
-
-/// Escape special characters for the management interface
-fn escape_management_string(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
 }
 
 #[cfg(test)]
@@ -1367,41 +1176,6 @@ mod tests {
         assert_eq!(extract_open_url(msg), None);
     }
 
-    // -- extract_auth_token --------------------------------------------------
-
-    #[test]
-    fn extract_auth_token_handles_auth_token_colon_format() {
-        let msg = "AUTH_TOKEN:abc123XYZ";
-        assert_eq!(extract_auth_token(msg), Some("abc123XYZ".to_string()));
-    }
-
-    #[test]
-    fn extract_auth_token_handles_auth_token_colon_format_case_insensitively() {
-        let msg = "auth_token:lowerCaseToken";
-        assert_eq!(extract_auth_token(msg), Some("lowerCaseToken".to_string()));
-    }
-
-    #[test]
-    fn extract_auth_token_handles_push_reply_comma_format() {
-        let msg = "PUSH_REPLY,dhcp-option DNS 1.2.3.4,auth-token,SESS_ID_AT_abcdef,ping 10";
-        assert_eq!(
-            extract_auth_token(msg),
-            Some("SESS_ID_AT_abcdef".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_auth_token_handles_cr_response_format() {
-        let msg = "CR_RESPONSE:sometokenvalue";
-        assert_eq!(extract_auth_token(msg), Some("sometokenvalue".to_string()));
-    }
-
-    #[test]
-    fn extract_auth_token_returns_none_when_no_token_present() {
-        let msg = "just a regular log message with no token";
-        assert_eq!(extract_auth_token(msg), None);
-    }
-
     // -- redact_tokens ------------------------------------------------------
 
     #[test]
@@ -1429,34 +1203,10 @@ mod tests {
         let line = ">STATE:1793908794,CONNECTED,SUCCESS,10.20.93.78,80.150.73.4,11194,,";
         assert_eq!(redact_tokens(line), line);
     }
-
     #[test]
     fn redact_tokens_leaves_marker_without_value_unchanged() {
         let line = ">STATE:1794002794,RECONNECTING,auth-failure (auth-token),,,,,";
         assert_eq!(redact_tokens(line), line);
-    }
-
-    // -- escape_management_string --------------------------------------------
-
-    #[test]
-    fn escape_management_string_escapes_quotes_and_backslashes() {
-        // input contains a literal backslash followed by a double quote
-        let input = "foo\"bar\\baz";
-        let expected = "foo\\\"bar\\\\baz";
-        assert_eq!(escape_management_string(input), expected);
-    }
-
-    #[test]
-    fn escape_management_string_escapes_newlines() {
-        let input = "line1\nline2";
-        let expected = "line1\\nline2";
-        assert_eq!(escape_management_string(input), expected);
-    }
-
-    #[test]
-    fn escape_management_string_leaves_plain_text_unchanged() {
-        let input = "plain-token-123";
-        assert_eq!(escape_management_string(input), input);
     }
 }
 
